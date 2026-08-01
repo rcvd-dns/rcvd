@@ -1,0 +1,100 @@
+# RCVD — Example 1: Mode-1 Forwarder with a 3-provider encrypted fallback chain
+#
+# WHO THIS IS FOR: run RCVD as a local/LAN DNS forwarder. Clients send plaintext DNS
+# to RCVD on your loopback or LAN; RCVD forwards every query over an ENCRYPTED transport
+# (DoQ → DoT → DoH) to public resolvers. RCVD never emits cleartext DNS to the network —
+# if all encrypted upstreams fail, it returns SERVFAIL (or a bounded-stale answer), never
+# a plaintext fallback.
+#
+# WHAT IT DEMONSTRATES:
+#   - Mode 1 only (a forwarder — no inbound encrypted service).
+#   - A real fallback chain across THREE providers and THREE transports:
+#       AdGuard DoQ (primary) → Cloudflare DoT → Quad9 DoH (port-443 escape hatch).
+#   - Aggressive caching (one warm cache in front of the whole chain).
+#   - The [fallback] health-check state machine.
+#
+# TRY IT:
+#   rcvd --config /etc/rcvd/mode1-forwarder-3providers.toml
+#   dig @127.0.0.1 -p 5300 example.com
+#   rcvd --stats --config /etc/rcvd/mode1-forwarder-3providers.toml
+
+stats_enabled = true
+
+# ── Mode 1: the plaintext-side listener clients point at ─────────────────────────────────
+# Default RCVD port is 5300 (coexists with systemd-resolved on 53). To serve a whole LAN,
+# bind a LAN IP (e.g. "192.0.2.1:5300") and point your DHCP-advertised DNS at it. Binding
+# port 53 needs CAP_NET_BIND_SERVICE (or run behind dnsmasq/systemd-resolved forwarding here).
+[resolver]
+enabled = true
+listen = "127.0.0.1:5300"
+
+# ── Upstream chain: tried in order. First that answers wins; failures fall through. ───────
+#
+# ★ BOOTSTRAP HARDENING — pin `ip` on every upstream. Without it, RCVD must resolve the
+#   upstream's hostname (e.g. dns.adguard.com) to get a dial target, and that first lookup
+#   can only go out as CLEARTEXT DNS — the exact leak RCVD exists to prevent. Setting `ip`
+#   makes the dial target explicit so there is ZERO cleartext bootstrap. `host` is still
+#   used for TLS SNI / certificate validation; `ip` is only the dial address.
+#
+#   Uncomment each `ip` line below and replace "change-me" with the provider's current
+#   IP (verify from the provider's docs; anycast IPs are stable but confirm before you rely
+#   on them). Keep `host` as the certificate hostname — do NOT put the IP in `host`.
+
+# Upstream 1 — AdGuard DoQ (RFC 9250). DNS-over-QUIC is the preferred transport.
+[[upstreams]]
+name = "AdGuard DoQ"
+host = "dns.adguard.com"
+# ip = "change-me"                  # e.g. AdGuard's DoQ anycast IP — pin to avoid cleartext bootstrap
+port = 853
+doq = true
+
+# Upstream 2 — Cloudflare DoT (RFC 7858). Note: `host` must be the certificate hostname
+# (cloudflare-dns.com), NOT the IP literal, or TLS validation fails.
+[[upstreams]]
+name = "Cloudflare DoT"
+host = "cloudflare-dns.com"
+# ip = "change-me"                  # e.g. 1.1.1.1 — pin to avoid cleartext bootstrap
+port = 853
+dot = true
+
+# Upstream 3 — Quad9 DoH (RFC 8484) on port 443. The escape hatch for networks that only
+# allow outbound 443.
+[[upstreams]]
+name = "Quad9 DoH"
+host = "dns.quad9.net"
+# ip = "change-me"                  # e.g. 9.9.9.9 — pin to avoid cleartext bootstrap
+port = 443
+doh = true
+doh_path = "/dns-query"
+
+# ── DNSSEC validation (on by default; shown explicitly for clarity) ──────────────────────
+[dnssec]
+enabled = true
+
+# ── One shared cache in front of the whole chain ─────────────────────────────────────────
+# mode = "aggressive" adds negative caching + serve-stale (a validated, previously-cached
+# answer may be served past expiry ONLY when upstreams fail — never cleartext).
+# Modes: "light" | "standard" (default) | "aggressive". Mode is mutually exclusive with the
+# manual ttl_min/ttl_max/neg_ttl_max/serve_stale_max_s knobs.
+[cache]
+enabled = true
+type = "aggressive"
+max_size = 4096
+
+# ── Fallback health model (production-tuned defaults) ─────────────────────────────────────
+[fallback]
+phase1_timeout_ms = 2000          # startup: aggressive probing
+phase1_duration_s = 300           # 5-minute startup window
+phase2_failure_threshold = 3      # runtime: consecutive failures before an upstream = DOWN
+phase2_slow_threshold_ms = 200    # informational SLOW threshold
+health_check_interval_s = 30      # how often DOWN upstreams are re-probed for recovery
+
+# ── Logging (stderr by default; set a file path or "stdout" for containers) ──────────────
+[logging]
+level = "info"
+format = "text"
+
+# ── Optional blocklist. Plain domain list or hosts-file format (auto-detected). ──────────
+# [blocklists]
+# enabled = true
+# files = ["/etc/rcvd/blocklist.txt"]

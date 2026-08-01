@@ -1,0 +1,186 @@
+# Release pipeline — builds native Linux amd64 + arm64 binaries and attaches them,
+# with a SHA256SUMS file, to a GitHub Release.
+#
+# TRIGGER: push a version tag, e.g.
+#     git tag v0.1.0 && git push origin v0.1.0
+# The tag (minus the leading "v") is stamped into the binary as main.version, so a
+# released binary self-reports its real version + build date + build source:
+#     RCVD v0.1.0 (built 2026-07-07T10:00:00Z, source github-runner)
+#
+# RUNNERS: GitHub-hosted, free for public repos. Each architecture builds and tests
+# on its OWN NATIVE runner (ubuntu-26.04 = amd64, ubuntu-26.04-arm = arm64) — the
+# arm64 binary is compiled AND `go test ./...`'d on real arm64 hardware, not
+# cross-compiled on faith.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least-privilege by default; the job that publishes the release opts up to write.
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.x"   # matches the go.mod toolchain floor (go 1.26.4)
+
+jobs:
+  # ── Verify the embedded DNSSEC root anchor is genuine before we build/ship ────────────
+  # rcvd embeds IANA's root trust anchor. This gate proves the committed
+  # internal/dnssec/root-anchors.xml still matches IANA's cryptographically signed
+  # anchor (CMS/S-MIME chained to the pinned ICANN CA), so a tampered or stale
+  # anchor (e.g. after a missed KSK rollover) blocks the whole release.
+  verify-anchors:
+    name: verify DNSSEC root anchor
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify committed root-anchors.xml against IANA's signed anchor
+        run: sh scripts/verify-anchors.sh
+
+  # ── Build every target; test natively where the runner arch matches ──────────────────
+  # rcvd is pure Go, CGO_ENABLED=0, so the darwin binaries CROSS-COMPILE cleanly from
+  # Linux (no Xcode, no C toolchain) — no need for (10×-billed) macOS runners just to
+  # produce them. The two Linux targets still build+test on their OWN native runner
+  # (amd64 on ubuntu-26.04, arm64 on ubuntu-26.04-arm), so the arm64 suite executes on
+  # real arm64. The darwin targets are compile-verified here; `go test` for them runs on
+  # the matching-arch Linux runner via the shared code (a CGO-free binary has no
+  # darwin-specific link path to exercise at build time).
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify-anchors   # do not build/ship if the trust anchor doesn't verify
+    strategy:
+      fail-fast: true      # if one target fails to build/test, don't ship a half release
+      matrix:
+        include:
+          # Linux — native runners (build AND test on-arch).
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-26.04
+            artifact: rcvd-linux-amd64
+            native: true
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-26.04-arm
+            artifact: rcvd-linux-arm64
+            native: true
+          # macOS — cross-compiled on the fast amd64 Linux runner (CGO_ENABLED=0).
+          - goos: darwin
+            goarch: amd64
+            runner: ubuntu-26.04
+            artifact: rcvd-macos-amd64
+            native: false
+          - goos: darwin
+            goarch: arm64
+            runner: ubuntu-26.04
+            artifact: rcvd-macos-arm64
+            native: false
+          # FreeBSD + NetBSD — cross-compiled on Linux too (no GitHub BSD runners exist;
+          # a CGO-free static binary needs none). Parity with the GitLab pipeline.
+          - goos: freebsd
+            goarch: amd64
+            runner: ubuntu-26.04
+            artifact: rcvd-freebsd-amd64
+            native: false
+          - goos: freebsd
+            goarch: arm64
+            runner: ubuntu-26.04
+            artifact: rcvd-freebsd-arm64
+            native: false
+          - goos: netbsd
+            goarch: amd64
+            runner: ubuntu-26.04
+            artifact: rcvd-netbsd-amd64
+            native: false
+          - goos: netbsd
+            goarch: arm64
+            runner: ubuntu-26.04
+            artifact: rcvd-netbsd-arm64
+            native: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Native test run — only where the runner arch matches the target (you can't run a
+      # darwin binary's tests on Linux). The two Linux legs cover both amd64 and arm64
+      # natively; the darwin cross-builds are compile-verified in the Build step below.
+      - name: Test
+        if: ${{ matrix.native }}
+        run: go test ./...
+
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}   # e.g. "v0.1.0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          # Strip a leading "v" from the tag for the stamped version string.
+          VER="${VERSION#v}"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w \
+              -X main.version=${VER} \
+              -X main.buildDate=${BUILD_DATE} \
+              -X main.buildSource=github-runner" \
+            -o "${{ matrix.artifact }}" \
+            ./cmd/rcvd
+          # Sanity: a NATIVE build must self-report the tagged version (can't exec a
+          # cross-compiled darwin binary on the Linux runner).
+          if [ "${{ matrix.native }}" = "true" ]; then
+            ./"${{ matrix.artifact }}" --version
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Collect all binaries, checksum them, publish the release ─────────────────────────
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write      # required to create/update the Release and upload assets
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true   # flatten both artifacts into dist/
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          chmod +x rcvd-linux-* rcvd-macos-* rcvd-freebsd-* rcvd-netbsd-*
+          sha256sum rcvd-linux-* rcvd-macos-* rcvd-freebsd-* rcvd-netbsd-* | tee SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rcvd-linux-amd64
+            dist/rcvd-linux-arm64
+            dist/rcvd-macos-amd64
+            dist/rcvd-macos-arm64
+            dist/rcvd-freebsd-amd64
+            dist/rcvd-freebsd-arm64
+            dist/rcvd-netbsd-amd64
+            dist/rcvd-netbsd-arm64
+            dist/SHA256SUMS
+          generate_release_notes: true   # auto changelog from merged PRs / commits since last tag
+          fail_on_unmatched_files: true

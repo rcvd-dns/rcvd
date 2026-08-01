@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  RCVD launchd service for macOS — INTEL (x86-64) build.
+  Target: macOS 26 (Tahoe) on Intel. See Notes/MacOS-26-Intel-notes.md.
+
+  ============================================================================
+  DEPLOYMENT MODEL — hardened, un-privileged, FHS-style
+  ============================================================================
+  This plist matches how rcvd is actually run in the field on an Intel Mac:
+
+    * runs as a dedicated, no-login service account `_rcvd` (UserName/GroupName
+      below) — NOT root. Port 5300 needs no privilege, so the daemon never has
+      any. (root is ONLY required if you later rebind to port 53.)
+    * binary at /usr/local/bin/rcvd (Mach-O x86_64 `rcvd-macos-amd64`).
+    * config at /etc/rcvd/rcvd.toml (FHS).
+    * logs/run state under /var/{log,run}/rcvd, owned by _rcvd.
+
+  (A Homebrew `brew services` install uses different, Homebrew-prefix paths and
+  runs as root — that is a separate packaging story, not this file.)
+
+  ---------------------------------------------------------------------------
+  WHY "intel64"
+  ---------------------------------------------------------------------------
+  Pairs with the Intel `rcvd-macos-amd64` binary (Mach-O x86_64). The arch
+  differentiator is the BINARY, not the paths (the arm64 plist installs to the
+  same /usr/local/bin/rcvd). macOS 26 note: boot-arg `nox86exec=1` can disable
+  Rosetta, but this build runs NATIVELY on Intel (no Rosetta). Do NOT run
+  rcvd-macos-amd64 on Apple Silicon — use the arm64 plist/binary there.
+
+  DoQ UDP buffer tuning is the same on both arches (net.inet.udp.recvspace /
+  sendspace — see install step 4); macOS has no Linux net.core.* equivalent.
+  ============================================================================
+
+  INSTALL (Intel Mac, hardened):
+    # 1. Create the dedicated _rcvd service account + group (no login, no home).
+    #    Pick a free UID/GID in the system range (<500); 440 is used here.
+    sudo dscl . -create /Groups/_rcvd PrimaryGroupID 440
+    sudo dscl . -create /Users/_rcvd  UniqueID 440
+    sudo dscl . -create /Users/_rcvd  PrimaryGroupID 440
+    sudo dscl . -create /Users/_rcvd  UserShell /usr/bin/false
+    sudo dscl . -create /Users/_rcvd  RealName "RCVD DNS service"
+    sudo dscl . -create /Users/_rcvd  NFSHomeDirectory /var/empty
+
+    # 2. Install the Intel binary
+    sudo install -m 755 rcvd-macos-amd64 /usr/local/bin/rcvd
+    # (only if quarantined after download/AirDrop — a locally-built binary is not)
+    sudo xattr -d com.apple.quarantine /usr/local/bin/rcvd 2>/dev/null || true
+
+    # 3. Config + log/run dirs.
+    sudo mkdir -p /etc/rcvd
+    sudo cp rcvd.toml /etc/rcvd/rcvd.toml
+    sudo mkdir -p /var/log/rcvd /var/run/rcvd
+    sudo chown -R _rcvd:_rcvd /var/log/rcvd /var/run/rcvd
+
+    # 4. (Recommended for DoQ) raise UDP socket buffers — macOS defaults are
+    #    much smaller than Linux. These reset on reboot; persist in /etc/sysctl.conf.
+    sudo sysctl -w net.inet.udp.recvspace=7340032
+    sudo sysctl -w net.inet.udp.sendspace=7340032
+    #    If quic-go still warns "failed to sufficiently increase receive buffer
+    #    size", also raise the overall ceiling:
+    sudo sysctl -w kern.ipc.maxsockbuf=8388608
+
+    # 5. (Optional) pre-authorize the Application Firewall to skip the prompt
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw -add /usr/local/bin/rcvd
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw -unblockapp /usr/local/bin/rcvd
+
+    # 6. Load + start (modern launchctl, macOS 11+)
+    sudo cp packaging/launchd/com.rcvd.dns.intel64.plist /Library/LaunchDaemons/com.rcvd.dns.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.rcvd.dns.plist
+    sudo launchctl enable system/com.rcvd.dns
+    sudo launchctl kickstart -k system/com.rcvd.dns
+
+  STATUS / LOGS:
+    sudo launchctl print system/com.rcvd.dns
+    tail -f /var/log/rcvd/rcvd.log
+    /usr/local/bin/rcvd -stats -config /etc/rcvd/rcvd.toml
+
+  VERIFY (query directly — no resolvectl on macOS):
+    dig -p 5300 @127.0.0.1 example.com
+    dig -p 5300 @127.0.0.1 example.com +dnssec
+
+  STOP / UNLOAD:
+    sudo launchctl bootout system/com.rcvd.dns
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rcvd.dns</string>
+
+    <!-- Run un-privileged as the dedicated _rcvd service account. -->
+    <key>UserName</key>
+    <string>_rcvd</string>
+    <key>GroupName</key>
+    <string>_rcvd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rcvd</string>
+        <string>-config</string>
+        <string>/etc/rcvd/rcvd.toml</string>
+    </array>
+
+    <!-- Start at load and keep running; relaunch on crash. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Throttle relaunches (matches systemd RestartSec=5). -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Capture stdout/stderr to the same log file rcvd appends to. -->
+    <key>StandardOutPath</key>
+    <string>/var/log/rcvd/rcvd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/rcvd/rcvd.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/var/run/rcvd</string>
+
+    <!-- Process type: background daemon (lower scheduling priority than UI). -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

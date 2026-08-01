@@ -1,0 +1,73 @@
+# RCVD — Flagship Example: DUAL-MODE (Mode 1 + Mode 2) sharing one warm cache
+#
+# ★ This is the config to reach for first. It shows RCVD's signature capability: a single
+#   process that is BOTH a plaintext-side forwarder (Mode 1) AND an encrypted service
+#   (Mode 2) — and both modes share ONE cache. A name resolved for a LAN client warms the
+#   cache for a browser hitting the DoH endpoint, and vice-versa.
+#
+# THE PICTURE:
+#
+#     LAN clients ──plaintext──▶ ┌─────────────────────────────┐
+#                                │           RCVD              │ ──encrypted──▶ upstream
+#     browsers/apps ──DoH/DoH3──▶ │  Mode 1 + Mode 2 + 1 cache │     (DoQ)      resolver
+#                                └─────────────────────────────┘
+#
+#   - Mode 1 accepts ordinary DNS on loopback/LAN and forwards it encrypted.
+#   - Mode 2 accepts DoH/DoH3 from browsers/apps and answers over TLS/QUIC.
+#   - BOTH resolve upstream over an encrypted transport. No cleartext ever leaves the host
+#     toward the upstream; if the upstream fails, RCVD returns SERVFAIL, never plaintext.
+#   - Kept deliberately simple: ONE upstream (AdGuard DoQ). Add more [[upstreams]] to build
+#     a fallback chain (see mode1-forwarder-3providers.toml).
+#
+# TRY IT:
+#   rcvd --config /etc/rcvd/flagship-dualmode.toml
+#   dig @127.0.0.1 -p 5300 example.com                        # Mode 1 (plaintext in)
+#   curl -k 'https://127.0.0.1:8443/dns-query?name=example.com&type=A' \
+#        -H 'accept: application/dns-json'                    # Mode 2 (DoH in)  [self-signed → -k]
+#   rcvd --stats --config /etc/rcvd/flagship-dualmode.toml    # watch the SHARED cache hit rate
+
+stats_enabled = true
+
+# ── Mode 1: plaintext-side forwarder ─────────────────────────────────────────────────────
+[resolver]
+enabled = true
+listen = "127.0.0.1:5300"
+
+# ── Mode 2: encrypted DoH + DoH3 service ─────────────────────────────────────────────────
+[upstream_service]
+enabled = true
+listen_doh = "0.0.0.0:8443"
+doh3 = true
+# Self-signed cert to keep this example zero-setup (curl -k / dev). For real browsers, switch
+# to a CA-trusted cert via [tls_automation] — see mode2-doh-service.toml for all three options.
+tls_cert_autogen = true
+
+# ── One simple encrypted upstream (add more for a fallback chain) ────────────────────────
+#
+# ★ BOOTSTRAP HARDENING — pin `ip` so RCVD never has to resolve the upstream hostname over
+#   CLEARTEXT DNS to find its dial target (the exact leak RCVD exists to prevent). `host`
+#   stays the TLS SNI / cert hostname; `ip` is only the dial address. Uncomment and set it.
+[[upstreams]]
+name = "AdGuard DoQ"
+host = "dns.adguard.com"
+# ip = "change-me"                  # e.g. AdGuard's DoQ anycast IP — pin to avoid cleartext bootstrap
+port = 853
+doq = true
+
+[dnssec]
+enabled = true
+
+# ── THE shared cache — one object serving BOTH modes ─────────────────────────────────────
+[cache]
+enabled = true
+type = "aggressive"
+max_size = 4096
+
+[logging]
+level = "info"
+format = "text"
+
+# ── Optional blocklist (applies to BOTH modes) ───────────────────────────────────────────
+# [blocklists]
+# enabled = true
+# files = ["/etc/rcvd/blocklist.txt"]

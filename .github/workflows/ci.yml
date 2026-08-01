@@ -1,0 +1,84 @@
+# CI — fast pre-merge gate. Runs on PRs targeting main and on direct pushes to main.
+#
+# SCOPE: Linux only, on purpose. rcvd is pure Go (CGO_ENABLED=0), so the darwin/BSD
+# release binaries are CROSS-COMPILED and need no per-OS runner to prove correctness —
+# the source either compiles for every GOOS or it doesn't, and the LOGIC is what a PR
+# changes. So the pre-merge gate keeps it cheap and fast: vet + the full test suite on
+# native amd64 + arm64, plus the DNSSEC anchor check. The full cross-platform BUILD
+# matrix (macOS/FreeBSD/NetBSD artifacts) lives in release.yml and fires only on tags.
+#
+# (`go vet ./...` is inherently cross-platform aware; a `cross-compile` step below also
+# proves every release GOOS/GOARCH still builds, so a merge can't silently break one.)
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.x"   # matches the go.mod toolchain floor (go 1.26.4)
+
+jobs:
+  # ── DNSSEC root-anchor gate (same check as release.yml) ──────────────────────────────
+  verify-anchors:
+    name: verify DNSSEC root anchor
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify committed root-anchors.xml against IANA's signed anchor
+        run: sh scripts/verify-anchors.sh
+
+  # ── vet + test natively on amd64 AND arm64 ───────────────────────────────────────────
+  test:
+    name: test ${{ matrix.arch }}
+    strategy:
+      fail-fast: false     # show BOTH arches' results even if one fails
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
+  # ── Prove every RELEASE target still cross-compiles (no artifacts kept) ──────────────
+  # Catches a merge that breaks a non-Linux GOOS build before it ever reaches a tag.
+  cross-compile:
+    name: cross-compile check
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build every release GOOS/GOARCH (compile only)
+        run: |
+          set -euo pipefail
+          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 \
+                   freebsd/amd64 freebsd/arm64 netbsd/amd64 netbsd/arm64"
+          for t in $targets; do
+            echo "== $t =="
+            CGO_ENABLED=0 GOOS="${t%/*}" GOARCH="${t#*/}" \
+              go build -trimpath -o /dev/null ./cmd/rcvd
+          done
+          echo "all release targets compile."

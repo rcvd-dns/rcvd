@@ -1,0 +1,102 @@
+# RCVD — Example 2: Mode-2 Encrypted Upstream Service (DoH / DoH3)
+#
+# WHO THIS IS FOR: expose your OWN encrypted DNS endpoint. Other tools, browsers, and
+# devices point their DoH/DoT/DoQ settings at RCVD, and RCVD answers over TLS/QUIC. This
+# is the "run your own encrypted resolver front-end" role.
+#
+# WHAT IT DEMONSTRATES:
+#   - Mode 2 only (a service — no plaintext forwarder listening).
+#   - A DoH endpoint over HTTP/2 (TCP) AND DoH3 over HTTP/3 (QUIC/UDP) on the same port.
+#   - The three ways to provision the server's TLS certificate (pick ONE).
+#   - Mode 2 still resolves upstream over an encrypted transport (never cleartext).
+#
+# NOTE: Mode 2 needs upstreams too — it must resolve the queries it's handed. The
+# [[upstreams]] block below is the same encrypted-egress idea as the Mode-1 example.
+#
+# TRY IT (self-signed / dev):
+#   rcvd --config /etc/rcvd/mode2-doh-service.toml
+#   kdig -d @127.0.0.1 +https +tls-ca +https=/dns-query example.com   # or: curl -k ...
+
+stats_enabled = true
+
+# ── Mode 1 explicitly OFF — this instance is a service, not a forwarder ───────────────────
+[resolver]
+enabled = false
+
+# ── Mode 2: the encrypted service you expose to clients ──────────────────────────────────
+[upstream_service]
+enabled = true
+
+# Serve DoH (RFC 8484) on 8443. With doh3 = true, RCVD ALSO serves DoH3 (RFC 8484 over
+# HTTP/3, RFC 9114) on the same address over QUIC/UDP, and advertises it via Alt-Svc.
+listen_doh = "0.0.0.0:8443"
+doh3 = true
+
+# You may also expose DoT and/or DoQ (RFC 7858 / RFC 9250):
+#   listen_dot = "0.0.0.0:853"
+#   listen_doq = "0.0.0.0:853"
+
+# ── TLS certificate — pick EXACTLY ONE of the three approaches below ─────────────────────
+#
+# (A) SELF-SIGNED (dev/test, or behind a TLS-terminating proxy). curl -k works; real
+#     browsers will REFUSE it for direct DoH. tls_cert_hosts adds extra SAN names/IPs
+#     (e.g. a LAN hostname or tunnel domain) beyond the auto-derived bind address.
+tls_cert_autogen = true
+# tls_cert_hosts = ["router.lan", "192.0.2.1"]
+#
+# (B) BRING-YOUR-OWN cert (Tailscale `tailscale cert`, a corporate CA, etc.):
+# tls_cert = "/etc/rcvd/tls/fullchain.pem"
+# tls_key  = "/etc/rcvd/tls/privkey.pem"
+#
+# (C) AUTOMATIC CA-trusted cert via ACME (certmagic). REQUIRED for direct-to-browser DoH
+#     (Firefox/Chrome ignore self-signed exceptions for TRR/DoH). See the [tls_automation]
+#     block at the bottom; set `tls_automation = true` here to activate it.
+# tls_automation = true
+
+# ── Upstreams: Mode 2 resolves the queries it serves, over encrypted transports ──────────
+#
+# ★ BOOTSTRAP HARDENING — pin `ip` on every upstream. Without it, RCVD must resolve the
+#   upstream's hostname to get a dial target, and that first lookup can only go out as
+#   CLEARTEXT DNS — the exact leak RCVD exists to prevent. Setting `ip` makes the dial
+#   target explicit (zero cleartext bootstrap). `host` stays the TLS SNI / cert hostname.
+#   Uncomment each `ip` line and replace "change-me" with the provider's current IP.
+[[upstreams]]
+name = "AdGuard DoQ"
+host = "dns.adguard.com"
+# ip = "change-me"                  # e.g. AdGuard's DoQ anycast IP — pin to avoid cleartext bootstrap
+port = 853
+doq = true
+
+[[upstreams]]
+name = "Cloudflare DoT"
+host = "cloudflare-dns.com"
+# ip = "change-me"                  # e.g. 1.1.1.1 — pin to avoid cleartext bootstrap
+port = 853
+dot = true
+
+[dnssec]
+enabled = true
+
+[cache]
+enabled = true
+type = "aggressive"
+max_size = 4096
+
+[logging]
+level = "info"
+format = "text"
+
+# ── (C) ACME / certmagic — only used if `tls_automation = true` above ────────────────────
+# Real Let's Encrypt cert, auto-renewed. Requires a real domain that resolves to this host.
+# HTTP-01 (default) needs inbound :80/:443. DNS-01 needs NO inbound port (works behind
+# tunnels/CGNAT) but requires a supported DNS provider + a scoped API token.
+# [tls_automation]
+# on_demand = true
+# allowed_domains = ["dns.example.com"]   # restrict which names certs are issued for
+# email = "admin@example.com"
+# staging = true                          # use LE staging CA while testing (untrusted, no rate limits)
+#
+# # DNS-01 example (no inbound port needed):
+# challenge = "dns01"
+# dns_provider = "cloudflare"
+# dns_api_token_env = "RCVD_DNS_API_TOKEN"   # read the token from this env var (preferred over inline)

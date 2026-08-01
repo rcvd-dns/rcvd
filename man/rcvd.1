@@ -1,0 +1,341 @@
+.nh
+.TH rcvd 1 "21 July 2026" "rcvd 0.1.0" "User Commands"
+.SH NAME
+rcvd - Resilient, Cryptographic, Verifiable DNS
+
+.SH SYNOPSIS
+\fBrcvd\fP [\fB-config\fP \fIpath\fP] [\fIflag\fP]
+
+.SH DESCRIPTION
+\fBrcvd\fP is a single statically-linked binary that performs privacy-first encrypted DNS
+forwarding and serving. Its defining invariant: every query that leaves the host does so over
+an encrypted transport. If every configured encrypted upstream fails, \fBrcvd\fP returns SERVFAIL
+rather than falling back to cleartext DNS. Port 53 is never a plaintext egress: \fBrcvd\fP may
+accept plaintext queries on a \fBloopback\fP port 53 (Mode 1), but every query leaving the host
+is encrypted, and binding port 53 on a non-loopback interface is rejected at startup.
+
+.PP
+\fBrcvd\fP operates in two modes, selectable per configuration file:
+
+.PP
+\fBMode 1 (Forwarder):\fP Accepts plain DNS from local or LAN clients (loopback or configured
+listen address) and forwards each query upstream over an encrypted transport (DoQ, DoT, or
+DoH). The client-to-rcvd link is plaintext; the off-host leg is always encrypted.
+
+.PP
+\fBMode 2 (Upstream Service):\fP Exposes encrypted DoH, DoT, and/or DoQ endpoints that other
+resolvers or browsers query directly. Both ends of the query path are then encrypted. TLS
+certificates are provided via auto-generated self-signed certificate (testing),
+operator-supplied cert/key, or certmagic ACME automation.
+
+.PP
+Because both the forwarding and serving legs are encrypted, two or more \fBrcvd\fP instances in
+different locations can be chained - a Mode 1 forwarder pointing at another instance's Mode
+2 endpoint - with the off-host link encrypted end to end.
+
+.PP
+Both modes may run simultaneously from a single process, sharing one in-memory cache.
+
+.PP
+All flags are boolean (they take no value argument). The config file path is the one exception
+and uses \fB-config\fP \fIpath\fP\&. Passing a path as a bare positional argument is an error — see
+\fBCOMMON MISTAKES\fP below.
+
+.SH OPTIONS
+\fB-config\fP \fIpath\fP
+
+.PP
+Path to the TOML configuration file. Defaults to \fBrcvd.toml\fP in the current directory. For system deployments use the full path, e.g. \fB/etc/rcvd/rcvd.toml\fP\&.
+
+.PP
+\fB-stats\fP
+
+.PP
+Connect to the running instance's Unix socket and print aggregate statistics, then exit. Requires \fBstats_enabled = true\fP in the configuration file. The socket path is derived from the config file name.
+
+.PP
+\fB-audit\fP
+
+.PP
+Connect to the running instance's Unix socket and print the live posture report: active listeners, no-cleartext invariant confirmation, and cache type. Requires \fBstats_enabled = true\fP\&. The posture reflects the running process's loaded configuration — not just the file on disk — confirming what is actually in force.
+
+.PP
+\fB-blocklist-reload\fP
+
+.PP
+Connect to the running instance's Unix socket and trigger a hot-reload of the blocklist \fBfiles\fP (from \fB[blocklists] files\fP), then exit. Requires \fBstats_enabled = true\fP\&. The reload rebuilds the entire in-memory set from the files on disk and atomically swaps it in, so both \fBadded and removed\fP domains take effect without restarting the process — preserving statistics, cache, and connections. It is asynchronous and non-blocking: the command returns immediately with an acknowledgment while the (potentially minute-long) rescan runs in the background, exactly like the startup load, so DNS is never paused. Final counts are written to the daemon log when the swap completes. Edit the file(s), then run this. Only local \fBfiles\fP are reloaded; \fBupdate_urls\fP are not re-fetched.
+
+.PP
+\fB-verify-upstream\fP
+
+.PP
+Load the configuration, probe every configured upstream with a real, \fBCA-validating\fP TLS handshake, and print the certificate chain for each: subject, issuer, SANs, validity window, key type, and SHA-256 fingerprint. Does not require a running instance. Exits non-zero if any upstream probe fails.
+
+.PP
+This verb asks only "does the upstream present a CA-valid (Web-PKI or private-CA) certificate for its name?" — it is intentionally \fBnot\fP pin-aware. An upstream that is verified in production by an SPKI \fBpin\fP (a self-signed leg with \fBpinned_pubkey\fP set) will FAIL here with \fIcertificate signed by unknown authority\fP — that is EXPECTED and does not mean the live path is broken. The output flags such an upstream and points to \fB-verify-pin\fP\&. Use \fB-verify-pin\fP to validate a pinned upstream.
+
+.PP
+\fB-verify-pin\fP
+
+.PP
+Load the configuration and, for every upstream that has \fBpinned_pubkey\fP set, dial it the way the live pinned resolver path does (no CA-chain check; exact SubjectPublicKeyInfo match) and report \fBOK\fP or \fBMISMATCH\fP against the configured pin. Upstreams with no pin are skipped. Does not require a running instance. Exits zero only if every pinned upstream matches — suitable for cron/monitoring to catch a silent key rotation on the far end. This is the AUDIT verb of the pin lifecycle; see \fB-show-pin\fP for bootstrap.
+
+.PP
+\fB-show-pin\fP \fIindex\fP
+
+.PP
+Probe the upstream at the given \fB0-based index\fP into the \fB[[upstreams]]\fP list, and print JUST its leaf SPKI pin (\fBsha256//BASE64\fP) to standard output — nothing else — ready to paste into that upstream's \fBpinned_pubkey\fP\&. All diagnostics go to standard error, so \fBpin=$(rcvd -show-pin 0 -config /etc/rcvd/rcvd.toml)\fR captures exactly the pin. No pin need be configured (that is the point — you are generating one). Works against a self-signed leg. This is the BOOTSTRAP verb of the pin lifecycle: \fB-show-pin\fP (generate) → \fBpinned_pubkey\fP (configure) → \fB-verify-pin\fP (audit).
+
+.PP
+\fB-verify-self\fP
+
+.PP
+Probe THIS instance's own Mode-2 listeners (DoH/DoT/DoQ) with a real TLS handshake and print the certificate presented to clients: subject, issuer, SANs, validity window, key type, fingerprint, and the leaf \fBSPKI pin\fP (\fBsha256//BASE64\fP). The pin is the same value a client configures as \fBpinned_pubkey\fP and validates with \fB-verify-pin\fP, so an operator managing both ends can copy it directly from this output. Classifies the cert source as SELF-SIGNED (tls_cert_autogen) or CA-ISSUED (certmagic/ACME or bring-your-own). Requires the instance to be running with Mode 2 enabled. If Mode 2 is disabled, reports that there is nothing to verify.
+
+.PP
+\fB-server-name\fP \fIname\fP
+
+.PP
+TLS SNI hostname to use when probing with \fB-verify-self\fP\&. Defaults to the hostname derived from each listener's configured address. Pass the real public DoH hostname when the instance uses certmagic on-demand TLS, so the cert is materialized for inspection.
+
+.PP
+\fB-version\fP
+
+.PP
+Print the version string and build timestamp, then exit.
+
+.PP
+\fB-help\fP
+
+.PP
+Print a short usage summary, then exit.
+
+.SH COMMON MISTAKES
+\fBrcvd\fP action flags are boolean and do not consume a path argument. Passing a path
+positionally is silently parsed as a leftover argument and causes an error. The config
+path always goes with \fB-config\fP:
+
+.EX
+WRONG:  rcvd --stats /etc/rcvd/rcvd.toml
+RIGHT:  rcvd -config /etc/rcvd/rcvd.toml -stats
+
+WRONG:  rcvd --verify-self /etc/rcvd/rcvd.toml
+RIGHT:  rcvd -config /etc/rcvd/rcvd.toml -verify-self
+.EE
+
+.PP
+\fBrcvd\fP will print a diagnostic naming the unexpected argument and show the corrected form.
+
+.SH EXAMPLES
+\fBRun a Mode-1 forwarder (local host)\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd-resolver.toml
+.EE
+
+.PP
+\fBRun a Mode-1 LAN-facing router forwarder\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd-router.toml
+.EE
+
+.PP
+\fBRun a Mode-2 upstream service (DoH/DoT/DoQ endpoint)\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd-upstream.toml
+.EE
+
+.PP
+\fBQuery live statistics from a running instance\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd.toml -stats
+.EE
+
+.PP
+\fBInspect the live posture of a running instance\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd.toml -audit
+.EE
+
+.PP
+\fBHot-reload the blocklist after editing it (no restart, stats preserved)\fP
+
+.EX
+# edit /etc/rcvd/domainswild — add or remove domains
+rcvd -config /etc/rcvd/rcvd.toml -blocklist-reload
+.EE
+
+.PP
+\fBVerify TLS certificates of all configured upstreams (CA validation)\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd.toml -verify-upstream
+.EE
+
+.PP
+\fBGenerate the SPKI pin for the first upstream (bootstrap a pin)\fP
+
+.EX
+pin=$(rcvd -config /etc/rcvd/rcvd.toml -show-pin 0)
+# paste $pin into that upstream's pinned_pubkey = "sha256//…"
+.EE
+
+.PP
+\fBValidate configured pins against the live servers (audit)\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd.toml -verify-pin
+.EE
+
+.PP
+\fBInspect the TLS certificate this Mode-2 instance presents to clients\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd-upstream.toml -verify-self
+.EE
+
+.PP
+\fBInspect the cert using a specific hostname (for certmagic on-demand TLS)\fP
+
+.EX
+rcvd -config /etc/rcvd/rcvd-upstream.toml -verify-self -server-name doh.example.com
+.EE
+
+.SH FILES
+\fB/etc/rcvd/\fP
+
+.PP
+Default directory for configuration files. Multiple config files are kept here; one is activated per running instance via \fB-config\fP\&.
+
+.PP
+\fB/etc/rcvd/rcvd.toml\fP (or symlink)
+
+.PP
+The conventionally active configuration file on production deployments.
+
+.PP
+\fB/run/rcvd/*\&.sock\fP
+
+.PP
+Unix sockets for the statistics and audit interface, one per running instance. The socket name is derived from the config file name (e.g. \fBrcvd.toml\fP → \fBrcvd.sock\fP).
+
+.PP
+\fB/var/log/rcvd/rcvd.log\fP
+
+.PP
+Default log file (used when \fB[logging] file\fP is unset). Set \fBfile = "stdout"\fP in the \fB[logging]\fP section to log to stdout instead (recommended for containers), or \fBfile = "stderr"\fP\&.
+
+.SH CONFIGURATION
+Configuration is TOML. Strict unknown-key rejection is enforced: any unrecognized key is a
+hard startup error rather than a silently-ignored typo.
+
+.PP
+Key sections:
+
+.PP
+\fB[resolver]\fP — Mode 1 forwarder settings. \fBenabled\fP activates Mode 1 (a config may define
+this section without turning it on). \fBlisten\fP sets the address and port (default
+\fB127.0.0.1:5300\fP). Binding port 53 on a non-loopback address is rejected at startup.
+
+.PP
+\fB[[upstreams]]\fP — One block per upstream. \fBhost\fP is the hostname used for TLS SNI and
+certificate validation (required). \fBname\fP is an optional label for statistics output, and
+\fBport\fP is \fBrequired\fP and explicit — rcvd assumes no default, so state the port you intend
+to reach (typically 853 for DoQ/DoT, 443 for DoH). Each block selects
+exactly one encrypted protocol: \fBdoq = true\fP (DNS-over-QUIC, RFC 9250), \fBdot = true\fP
+(DNS-over-TLS, RFC 7858), or \fBdoh = true\fP (DNS-over-HTTPS, RFC 8484). For DoH, \fBdoh_path\fP
+sets the query path (default \fB/dns-query\fP) and \fBdoh3 = true\fP uses HTTP/3 over QUIC (DoH3)
+instead of HTTP/2 over TCP. Multiple blocks provide ordered fallback.
+
+.PP
+The optional \fBip\fP field pins the dial target so the upstream needs no name resolution at
+startup. Without it, rcvd cannot resolve the hostname itself — it has no cleartext bootstrap
+path — so you must supply the address (obtained out-of-band, e.g. with \fBdig\fP or \fBq\fP).
+The optional \fBpinned_pubkey\fP field pins the upstream's leaf SubjectPublicKeyInfo as \fBsha256//BASE64\fP
+(see \fB-show-pin\fP to generate one and \fB-verify-pin\fP to audit it); when set, that upstream is
+validated by exact key match rather than CA chain, enabling a self-signed encrypted leg.
+
+.PP
+\fB[upstream_service]\fP — Mode 2 service settings. \fBenabled\fP activates Mode 2. \fBlisten_doh\fP,
+\fBlisten_dot\fP, and \fBlisten_doq\fP set the endpoint addresses; \fBdoh3 = true\fP also serves DoH3
+(HTTP/3 over QUIC) on the \fBlisten_doh\fP address. TLS is configured via \fBtls_cert_autogen\fP
+(self-signed), \fBtls_cert\fP/\fBtls_key\fP (bring-your-own), or \fBtls_automation\fP (certmagic).
+With \fBtls_cert_autogen\fP, \fBtls_cert_hosts\fP adds extra hostnames or IPs to the self-signed
+certificate's SAN (e.g. a tunnel or LAN name that clients connect by) on top of the auto-derived
+listen-address hosts and loopback.
+
+.PP
+\fB[tls_automation]\fP — certmagic/ACME settings (when \fBtls_automation = true\fP). \fBchallenge\fP
+is \fBhttp\fP (default) or \fBdns01\fP (no inbound port; for tunnels/CGNAT). For \fBdns01\fP, set a
+supported \fBdns_provider\fP (MVP: \fBcloudflare\fP) and supply the API token from EXACTLY ONE of
+\fBdns_api_token\fP (inline), \fBdns_api_token_env\fP (name of an environment variable), or
+\fBdns_api_token_file\fP + \fBdns_api_token_key\fP (a dotenv file rcvd parses; a relative path
+resolves next to the config file). Setting more than one token source is a startup error.
+
+.PP
+\fB[blocklists]\fP — DNS filtering. \fBenabled\fP (default \fBtrue\fP) turns filtering on or off.
+\fBfiles\fP is a list of local blocklist files, each a plain domain list (preferred) or a hosts-file
+(auto-detected); wildcard entries (\fB*\&.example.com\fP) are supported. \fBupdate_urls\fP lists remote
+blocklists to fetch. A matched name is answered without leaving the host.
+
+.PP
+\fB[fallback]\fP — Multi-upstream health and failover. \fBphase1_duration_s\fP (default \fB300\fP) is
+the startup window of aggressive health checks before settling into steady state.
+\fBphase2_failure_threshold\fP is the number of consecutive failures that marks an upstream DOWN.
+\fBhealth_check_interval_s\fP (default \fB30\fP) sets the steady-state probe interval. Together these
+drive the ordered fallback across the configured \fB[[upstreams]]\fP\&.
+
+.PP
+\fB[cache]\fP — In-memory TTL cache. \fBenabled\fP (default \fBtrue\fP) turns caching on or off.
+\fBtype\fP selects a preset: \fBlight\fP, \fBstandard\fP (default), or \fBaggressive\fP (raises the
+TTL floor to 300s AND the TTL ceiling to 7 days, and enables negative caching and serve-stale).
+The preset is mutually exclusive with the manual \fBttl_min\fP/\fBttl_max\fP/\fBneg_ttl_max\fP/
+\fBserve_stale_max_s\fP knobs; setting both is a startup error.
+
+.PP
+\fB[dnssec]\fP — DNSSEC validation. Enabled by default. By default it validates against the IANA
+root trust anchor \fBembedded\fP in the binary (the public root KSK digest; no setup needed).
+\fBroot_key_file\fP overrides this with an operator-supplied anchor — either IANA
+\fBroot-anchors.xml\fP (DS) or a BIND-style \fBroot.key\fP (DNSKEY), auto-detected. Point it at the
+system anchor (e.g. \fB/var/lib/unbound/root.key\fP) so the OS owns trust-anchor updates,
+including the rare root KSK rollover, which rcvd does not yet track automatically (RFC 5011).
+
+.PP
+\fB[logging]\fP — \fBlevel\fP is \fBdebug\fP, \fBinfo\fP (default), \fBwarn\fP, or \fBerror\fP\&. \fBformat\fP
+is \fBtext\fP (default) or \fBjson\fP\&. \fBfile\fP is the log destination: an explicit path, or the
+special values \fBstdout\fP or \fBstderr\fP\&. When unset it defaults to \fB/var/log/rcvd/rcvd.log\fP\&.
+
+.PP
+\fBstats_enabled\fP — Set to \fBtrue\fP to enable the Unix socket for \fB-stats\fP and \fB-audit\fP\&.
+
+.PP
+See \fBdocs/CONFIG.md\fP in the source tree for full documentation of all keys.
+
+.SH EXIT STATUS
+\fB0\fP
+	Success.
+
+.PP
+\fB1\fP
+	Configuration error, upstream probe failure, or runtime error.
+
+.PP
+\fB2\fP
+	Invalid command-line usage (e.g. unexpected positional argument).
+
+.SH SEE ALSO
+\fBdig(1)\fP, \fBdnsmasq(8)\fP, \fBsystemd-resolved(8)\fP, \fBresolvectl(1)\fP
+
+.PP
+rcvd source and documentation: \fBhttps://rcvd.net\fP
+
+.SH HISTORY
+rcvd was originally created in 2026 as a privacy-first, encryption-mandatory DNS engine,
+focusing on the IETF standardized transports: DoT, DoH, and DoQ
+
+.SH AUTHORS
+Christopher Mosetick	office@cpm.is

@@ -1,0 +1,17 @@
+# .gitattributes controls what `git archive` and therefore GitHub release
+# tarballs emit. Paths marked `export-ignore` stay tracked in the repo but are
+# omitted from release archives, so they never reach a Homebrew formula, a
+# `go install` consumer, or a distro packager's source tarball.
+#
+# Rationale: the maintainer keeps local CI-testing scaffolding and scratch dirs
+# checked in for day-to-day work, but they do not need to be in a release tarball.
+
+# Local gitlab-ci-local test cache - maintainer-only, large, not for releases.
+.gitlab-ci-local/  export-ignore
+
+# Scratch/working dir — never ship.
+temp/              export-ignore
+
+# Repo meta that doesn't belong in a source tarball.
+.gitattributes     export-ignore
+.gitignore         export-ignore

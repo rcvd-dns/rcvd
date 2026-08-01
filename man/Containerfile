@@ -1,0 +1,16 @@
+# Throwaway image for viewing the rcvd(1) manpage.
+#
+# Build:       podman build -t rcvd-man-test .
+# View:        podman run --rm rcvd-man-test cat /usr/share/man/man1/rcvd.1 | man -l -
+# Interactive: podman run --rm -it rcvd-man-test /bin/bash  #then type: man rcvd
+# Clean:       podman rmi rcvd-man-test
+#
+# unminimize restores man content stripped from the Ubuntu minimal image.
+FROM docker.io/library/ubuntu:26.04
+
+RUN apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq man-db groff unminimize && \
+    yes | unminimize 2>/dev/null || true
+
+COPY rcvd.1 /usr/share/man/man1/rcvd.1
+RUN mandb -q

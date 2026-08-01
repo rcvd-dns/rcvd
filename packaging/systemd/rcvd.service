@@ -1,0 +1,58 @@
+[Unit]
+Description=RCVD - Resilient, Cryptographic, Verifiable DNS
+Documentation=https://github.com/rcvd-dns/rcvd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash -c 'touch /var/log/rcvd/rcvd.log && chown rcvd:rcvd /var/log/rcvd/rcvd.log && chmod 0640 /var/log/rcvd/rcvd.log'
+ExecStart=/usr/local/bin/rcvd -config /etc/rcvd/rcvd.toml
+Restart=on-failure
+RestartSec=5
+
+# Run as static rcvd user (create with: useradd --system --no-create-home --shell /usr/sbin/nologin --user-group rcvd)
+User=rcvd
+Group=rcvd
+RuntimeDirectory=rcvd
+LogsDirectory=rcvd
+
+# Capture stdout/stderr to log file
+StandardOutput=file:/var/log/rcvd/rcvd.log
+StandardError=file:/var/log/rcvd/rcvd.log
+
+# Filesystem isolation
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# RuntimeDirectory=rcvd already creates /run/rcvd owned by rcvd:rcvd — no extra paths needed
+
+# Privilege restrictions
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# If binding port 53, uncomment these two lines instead of the empty ones above:
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Network restrictions
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=any
+
+# Syscall and runtime hardening
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

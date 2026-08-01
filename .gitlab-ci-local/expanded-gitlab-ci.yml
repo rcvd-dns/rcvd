@@ -1,0 +1,457 @@
+stages:
+  - .pre
+  - test
+  - build
+  - release
+  - .post
+variables:
+  CGO_ENABLED: '0'
+  GOPATH: $CI_PROJECT_DIR/.gocache/gopath
+  GOCACHE: $CI_PROJECT_DIR/.gocache/gobuild
+.build_ldflags: >
+  BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+  LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+  main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+test:
+  stage: test
+  script:
+    - go vet ./...
+    - go test ./...
+  cache:
+    - key: &ref_0
+        files:
+          - go.sum
+      paths: &ref_1
+        - .gocache/
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+verify-anchors:
+  stage: test
+  script:
+    - apk add --no-cache openssl curl
+    - sh scripts/verify-anchors.sh
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+.build:
+  stage: build
+  needs:
+    - test
+    - verify-anchors
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+build:linux-amd64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: linux
+    TARGET_ARCH: amd64
+    ARTIFACT: rcvd-linux-amd64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+build:linux-arm64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: linux
+    TARGET_ARCH: arm64
+    ARTIFACT: rcvd-linux-arm64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+build:macos-amd64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: darwin
+    TARGET_ARCH: amd64
+    ARTIFACT: rcvd-macos-amd64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+build:macos-arm64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: darwin
+    TARGET_ARCH: arm64
+    ARTIFACT: rcvd-macos-arm64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+build:netbsd-amd64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: netbsd
+    TARGET_ARCH: amd64
+    ARTIFACT: rcvd-netbsd-amd64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+build:netbsd-arm64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: netbsd
+    TARGET_ARCH: arm64
+    ARTIFACT: rcvd-netbsd-arm64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+build:freebsd-amd64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: freebsd
+    TARGET_ARCH: amd64
+    ARTIFACT: rcvd-freebsd-amd64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+build:freebsd-arm64:
+  stage: build
+  needs:
+    - job: test
+      artifacts: true
+      optional: false
+    - job: verify-anchors
+      artifacts: true
+      optional: false
+  script:
+    - >
+      BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      BUILD_VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+
+      LDFLAGS="-s -w -X main.buildDate=${BUILD_DATE} -X
+      main.buildSource=gitlab-runner -X main.version=${BUILD_VERSION}"
+    - >-
+      GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags
+      "$LDFLAGS" -o "$ARTIFACT" ./cmd/rcvd
+    - echo "Built $ARTIFACT ($BUILD_VERSION, $BUILD_DATE)"
+  artifacts:
+    name: $ARTIFACT
+    paths:
+      - $ARTIFACT
+    expire_in: 30 days
+  variables:
+    TARGET_OS: freebsd
+    TARGET_ARCH: arm64
+    ARTIFACT: rcvd-freebsd-arm64
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+checksums:
+  stage: release
+  needs:
+    - job: build:linux-amd64
+      artifacts: true
+      optional: false
+    - job: build:linux-arm64
+      artifacts: true
+      optional: false
+    - job: build:macos-amd64
+      artifacts: true
+      optional: false
+    - job: build:macos-arm64
+      artifacts: true
+      optional: false
+    - job: build:netbsd-amd64
+      artifacts: true
+      optional: false
+    - job: build:netbsd-arm64
+      artifacts: true
+      optional: false
+    - job: build:freebsd-amd64
+      artifacts: true
+      optional: false
+    - job: build:freebsd-arm64
+      artifacts: true
+      optional: false
+  script:
+    - >-
+      sha256sum rcvd-linux-* rcvd-macos-* rcvd-netbsd-* rcvd-freebsd-* | tee
+      SHA256SUMS
+  artifacts:
+    paths:
+      - SHA256SUMS
+      - rcvd-linux-*
+      - rcvd-macos-*
+      - rcvd-netbsd-*
+      - rcvd-freebsd-*
+    expire_in: 30 days
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+  image:
+    name: docker.io/library/golang:1.26.4-alpine
+release:
+  stage: release
+  needs:
+    - job: checksums
+      artifacts: true
+      optional: false
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  image:
+    name: registry.gitlab.com/gitlab-org/release-cli:latest
+  variables:
+    PKG: >-
+      ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rcvd/${CI_COMMIT_TAG}
+  script:
+    - >
+      apk add --no-cache curl
+
+      for f in rcvd-linux-amd64 rcvd-linux-arm64 rcvd-macos-amd64
+      rcvd-macos-arm64 \
+               rcvd-netbsd-amd64 rcvd-netbsd-arm64 rcvd-freebsd-amd64 rcvd-freebsd-arm64 SHA256SUMS; do
+        curl --fail --silent --show-error \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "$f" "${PKG}/${f}"
+        echo "uploaded $f"
+      done
+    - |
+      release-cli create \
+        --name "rcvd ${CI_COMMIT_TAG}" \
+        --tag-name "${CI_COMMIT_TAG}" \
+        --description "Static ${CI_COMMIT_TAG} binaries. Verify with SHA256SUMS." \
+        --assets-link "{\"name\":\"rcvd-linux-amd64\",\"url\":\"${PKG}/rcvd-linux-amd64\"}" \
+        --assets-link "{\"name\":\"rcvd-linux-arm64\",\"url\":\"${PKG}/rcvd-linux-arm64\"}" \
+        --assets-link "{\"name\":\"rcvd-macos-amd64\",\"url\":\"${PKG}/rcvd-macos-amd64\"}" \
+        --assets-link "{\"name\":\"rcvd-macos-arm64\",\"url\":\"${PKG}/rcvd-macos-arm64\"}" \
+        --assets-link "{\"name\":\"rcvd-netbsd-amd64\",\"url\":\"${PKG}/rcvd-netbsd-amd64\"}" \
+        --assets-link "{\"name\":\"rcvd-netbsd-arm64\",\"url\":\"${PKG}/rcvd-netbsd-arm64\"}" \
+        --assets-link "{\"name\":\"rcvd-freebsd-amd64\",\"url\":\"${PKG}/rcvd-freebsd-amd64\"}" \
+        --assets-link "{\"name\":\"rcvd-freebsd-arm64\",\"url\":\"${PKG}/rcvd-freebsd-arm64\"}" \
+        --assets-link "{\"name\":\"SHA256SUMS\",\"url\":\"${PKG}/SHA256SUMS\"}"
+  cache:
+    - key: *ref_0
+      paths: *ref_1
+      policy: pull-push
+      when: on_success
+default:
+  image: docker.io/library/golang:1.26.4-alpine
+  cache:
+    key: *ref_0
+    paths: *ref_1
