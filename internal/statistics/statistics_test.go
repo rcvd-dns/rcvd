@@ -2,6 +2,8 @@
 package statistics
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -296,16 +298,43 @@ func TestConcurrentIncrements(t *testing.T) {
 }
 
 func TestSocketPath(t *testing.T) {
-	// SocketPath derives socket name from config filename
-	// The directory depends on runtime environment (/run/rcvd/ if root, XDG fallback otherwise)
-	got := SocketPath("/etc/rcvd/rcvd.toml")
-	if !strings.HasSuffix(got, "/rcvd/rcvd.sock") {
-		t.Errorf("SocketPath: expected suffix /rcvd/rcvd.sock, got %q", got)
+	// SocketPath derives the socket NAME from the config filename; the DIRECTORY
+	// depends on the runtime environment, in precedence order:
+	//   1. /run/rcvd/<name>.sock       — if /run/rcvd exists (system daemon)
+	//   2. $XDG_RUNTIME_DIR/rcvd/<name>.sock — dev/workstation
+	//   3. /tmp/rcvd-<name>.sock       — last resort (neither of the above)
+	// The filename is invariant across all three, so assert on that unconditionally.
+	// (A minimal CI container has no /run/rcvd and no XDG_RUNTIME_DIR, so it lands
+	// on tier 3 — the earlier test wrongly assumed a "/rcvd/" dir segment always exists.)
+	// The socket NAME ends the path in every tier — joined as a directory in tiers
+	// 1/2 (".../rcvd/rcvd.sock") or prefixed in tier 3 ("/tmp/rcvd-rcvd.sock") — so
+	// HasSuffix on the name is the tier-invariant check (Base() is NOT: tier 3's
+	// "rcvd-" prefix makes Base() == "rcvd-rcvd.sock").
+	for _, tc := range []struct {
+		configPath string
+		wantName   string
+	}{
+		{"/etc/rcvd/rcvd.toml", "rcvd.sock"},
+		{"/etc/rcvd/rcvd-upstream.toml", "rcvd-upstream.sock"},
+	} {
+		got := SocketPath(tc.configPath)
+		if !strings.HasSuffix(got, tc.wantName) {
+			t.Errorf("SocketPath(%q): expected path ending in %q, got %q", tc.configPath, tc.wantName, got)
+		}
 	}
 
-	got = SocketPath("/etc/rcvd/rcvd-upstream.toml")
-	if !strings.HasSuffix(got, "/rcvd/rcvd-upstream.sock") {
-		t.Errorf("SocketPath: expected suffix /rcvd/rcvd-upstream.sock, got %q", got)
+	// Pin the XDG branch (tier 2) deterministically to prove the directory logic,
+	// independent of the ambient environment. Skip only if /run/rcvd exists on this
+	// machine, since tier 1 legitimately takes precedence over the XDG override.
+	if info, err := os.Stat("/run/rcvd"); err == nil && info.IsDir() {
+		t.Skip("skipping XDG-branch assertion: /run/rcvd exists (tier 1 takes precedence)")
+	}
+	xdg := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	got := SocketPath("/etc/rcvd/rcvd.toml")
+	want := filepath.Join(xdg, "rcvd", "rcvd.sock")
+	if got != want {
+		t.Errorf("SocketPath XDG branch: expected %q, got %q", want, got)
 	}
 }
 
