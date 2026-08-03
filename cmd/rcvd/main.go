@@ -104,7 +104,14 @@ func main() {
 	}
 
 	if *showVersion {
-		fmt.Printf("RCVD v%s (built %s, source %s, commit %s)\n", version, buildDate, buildSource, vcsRevision())
+		// Omit the commit when it's unknown (e.g. built from a release tarball,
+		// which carries no .git) — a bare "commit unknown" is just noise. Git
+		// builds (dev / CI) still show the revision.
+		if rev := vcsRevision(); rev != "unknown" {
+			fmt.Printf("RCVD v%s (built %s, source %s, commit %s)\n", version, buildDate, buildSource, rev)
+		} else {
+			fmt.Printf("RCVD v%s (built %s, source %s)\n", version, buildDate, buildSource)
+		}
 		os.Exit(0)
 	}
 
