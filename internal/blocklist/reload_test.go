@@ -55,10 +55,10 @@ func TestReplaceFromFilesAddsAndRemoves(t *testing.T) {
 	}
 	// Removed entries no longer block — this is what merge-only cannot do.
 	if b.IsBlocked("b.com") {
-		t.Error("expected b.com to STOP blocking after reload (subtract)")
+		t.Error("expected b.com to stop blocking after reload (subtract)")
 	}
 	if b.IsBlocked("x.ads.net") {
-		t.Error("expected *.ads.net to STOP blocking after reload (subtract)")
+		t.Error("expected *.ads.net to stop blocking after reload (subtract)")
 	}
 	// Untouched entry still blocks.
 	if !b.IsBlocked("a.com") {

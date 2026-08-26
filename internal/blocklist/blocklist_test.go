@@ -13,7 +13,7 @@ func TestBlocklistExactMatch(t *testing.T) {
 	b := New(true)
 
 	input := "example.com\nyahoo.com\n"
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -30,11 +30,61 @@ func TestBlocklistExactMatch(t *testing.T) {
 	}
 
 	if b.IsBlocked("google.com") {
-		t.Error("expected google.com to NOT be blocked")
+		t.Error("expected google.com to not be blocked")
 	}
 
-	if b.IsBlocked("sub.example.com") {
-		t.Error("expected sub.example.com to NOT be blocked (no wildcard)")
+	// A bare entry blocks its own subdomains too (dnsmasq address=/domain/ /
+	// OISD convention): "example.com" covers "example.com" and everything under it.
+	if !b.IsBlocked("sub.example.com") {
+		t.Error("expected sub.example.com to be blocked by bare entry example.com")
+	}
+	if !b.IsBlocked("deep.sub.example.com") {
+		t.Error("expected deep.sub.example.com to be blocked by bare entry example.com")
+	}
+
+	// But a sibling that merely shares a suffix label is not blocked.
+	if b.IsBlocked("notexample.com") {
+		t.Error("expected notexample.com to not be blocked")
+	}
+}
+
+// TestBlocklistUnderscoreLabel verifies underscore-containing hostnames load
+// (legal per RFC 2181; a stricter RFC 1123 regex used to silently drop them).
+func TestBlocklistUnderscoreLabel(t *testing.T) {
+	b := New(true)
+
+	input := "_dmarc.example.com\ntelemetry_v2.tracker.net\n"
+	skipped, err := b.parseFile(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("expected 0 skipped, got %d", skipped)
+	}
+	if !b.IsBlocked("_dmarc.example.com") {
+		t.Error("expected _dmarc.example.com to be blocked")
+	}
+	if !b.IsBlocked("telemetry_v2.tracker.net") {
+		t.Error("expected telemetry_v2.tracker.net to be blocked")
+	}
+}
+
+// TestBlocklistSkipCount verifies invalid lines are counted, not silently dropped.
+func TestBlocklistSkipCount(t *testing.T) {
+	b := New(true)
+
+	// Line 2 (leading hyphen) and line 3 (empty label) are invalid hostnames;
+	// the blank and comment lines are ignored and must not count as skipped.
+	input := "good.com\n-bad.com\nfoo..com\n\n# a comment\nalso-good.net\n"
+	skipped, err := b.parseFile(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if skipped != 2 {
+		t.Errorf("expected 2 skipped invalid lines, got %d", skipped)
+	}
+	if !b.IsBlocked("good.com") || !b.IsBlocked("also-good.net") {
+		t.Error("expected valid entries to load")
 	}
 }
 
@@ -43,7 +93,7 @@ func TestBlocklistWildcard(t *testing.T) {
 	b := New(true)
 
 	input := "*.example.com\n*.evil.net\n"
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -62,12 +112,12 @@ func TestBlocklistWildcard(t *testing.T) {
 
 	// Root domain itself should not match wildcard
 	if b.IsBlocked("example.com") {
-		t.Error("expected example.com (root) to NOT match *.example.com")
+		t.Error("expected example.com (root) to not match *.example.com")
 	}
 
 	// Non-matching domain
 	if b.IsBlocked("google.com") {
-		t.Error("expected google.com to NOT be blocked")
+		t.Error("expected google.com to not be blocked")
 	}
 }
 
@@ -81,7 +131,7 @@ func TestBlocklistHostsFormat(t *testing.T) {
 0.0.0.0 tracker.com
 ::1 ipv6-domain.com
 `
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -122,7 +172,7 @@ example.com
 yahoo.com
 # More comments
 `
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -135,7 +185,7 @@ yahoo.com
 	}
 
 	// Note: Inline comments on the same line (e.g., "example.com # comment")
-	// are NOT supported. Users should use separate lines for comments.
+	// are not supported. Users should use separate lines for comments.
 	// This is intentional for simplicity (no need to strip trailing comments).
 }
 
@@ -144,7 +194,7 @@ func TestBlocklistCaseSensitive(t *testing.T) {
 	b := New(true)
 
 	input := "Example.COM\nYAHOO.NET\n"
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -167,7 +217,7 @@ func TestBlocklistDisabled(t *testing.T) {
 	b := New(false) // disabled
 
 	input := "example.com\n"
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -186,7 +236,7 @@ yahoo.com
 *.evil.net
 *.ads.com
 `
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -213,7 +263,7 @@ func TestBlocklistClear(t *testing.T) {
 	b := New(true)
 
 	input := "example.com\nyahoo.com\n"
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -228,7 +278,7 @@ func TestBlocklistClear(t *testing.T) {
 	}
 
 	if b.IsBlocked("example.com") {
-		t.Error("expected example.com to NOT be blocked after clear")
+		t.Error("expected example.com to not be blocked after clear")
 	}
 }
 
@@ -246,7 +296,7 @@ _.com
 invalid..com
 ` // Some of these should be rejected, some loaded
 
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -265,11 +315,11 @@ invalid..com
 
 	// Invalid domains should not be loaded
 	if b.IsBlocked("-invalid.com") {
-		t.Error("expected -invalid.com (starts with hyphen) to NOT be loaded")
+		t.Error("expected -invalid.com (starts with hyphen) to not be loaded")
 	}
 
 	if b.IsBlocked("invalid-.com") {
-		t.Error("expected invalid-.com (label ends with hyphen) to NOT be loaded")
+		t.Error("expected invalid-.com (label ends with hyphen) to not be loaded")
 	}
 }
 
@@ -284,7 +334,7 @@ yahoo.com
 
 google.com
 `
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -311,13 +361,13 @@ func TestBlocklistMultilineAddition(t *testing.T) {
 
 	// First load
 	input1 := "example.com\nyahoo.com\n"
-	if err := b.parseFile(strings.NewReader(input1)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input1)); err != nil {
 		t.Fatalf("parse 1: %v", err)
 	}
 
 	// Second load (accumulate)
 	input2 := "google.com\n"
-	if err := b.parseFile(strings.NewReader(input2)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input2)); err != nil {
 		t.Fatalf("parse 2: %v", err)
 	}
 
@@ -339,7 +389,7 @@ func TestBlocklistDeepWildcard(t *testing.T) {
 	b := New(true)
 
 	input := "*.level1.example.com\n"
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -353,14 +403,14 @@ func TestBlocklistDeepWildcard(t *testing.T) {
 		t.Error("expected deep.sub.level1.example.com to match")
 	}
 
-	// Should NOT match parent domain
+	// Should not match parent domain
 	if b.IsBlocked("level1.example.com") {
-		t.Error("expected level1.example.com to NOT match *.level1.example.com")
+		t.Error("expected level1.example.com to not match *.level1.example.com")
 	}
 
-	// Should NOT match sibling
+	// Should not match sibling
 	if b.IsBlocked("other.level2.example.com") {
-		t.Error("expected other.level2.example.com to NOT match")
+		t.Error("expected other.level2.example.com to not match")
 	}
 }
 
@@ -374,7 +424,7 @@ example.com
 *.evil.net
 0.0.0.0 bad1.com bad2.com
 `
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -408,7 +458,7 @@ func TestBlocklistFQDN(t *testing.T) {
 
 	// Load with FQDN notation
 	input := "example.com.\nyahoo.com.\n"
-	if err := b.parseFile(strings.NewReader(input)); err != nil {
+	if _, err := b.parseFile(strings.NewReader(input)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
@@ -425,7 +475,7 @@ func TestBlocklistFQDN(t *testing.T) {
 	// Wildcards with FQDN
 	b2 := New(true)
 	input2 := "*.example.com.\n"
-	if err := b2.parseFile(strings.NewReader(input2)); err != nil {
+	if _, err := b2.parseFile(strings.NewReader(input2)); err != nil {
 		t.Fatalf("parse 2: %v", err)
 	}
 
@@ -444,7 +494,7 @@ func BenchmarkIsBlocked(b *testing.B) {
 		buf.WriteString(fmt.Sprintf("domain%d.com\n", i))
 	}
 
-	if err := blocklist.parseFile(&buf); err != nil {
+	if _, err := blocklist.parseFile(&buf); err != nil {
 		b.Fatalf("load: %v", err)
 	}
 
@@ -464,7 +514,7 @@ func BenchmarkWildcardIsBlocked(b *testing.B) {
 		buf.WriteString(fmt.Sprintf("*.domain%d.com\n", i))
 	}
 
-	if err := blocklist.parseFile(&buf); err != nil {
+	if _, err := blocklist.parseFile(&buf); err != nil {
 		b.Fatalf("load: %v", err)
 	}
 

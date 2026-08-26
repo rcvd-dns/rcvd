@@ -32,7 +32,15 @@ func New(enabled bool) *Blocklist {
 }
 
 // IsBlocked checks if a domain is in the blocklist.
-// Returns true if domain (exact match) or wildcard (*.example.com) matches.
+// Returns true if the domain matches by any of:
+//   - exact match:            entry "example.com" blocks "example.com"
+//   - bare-entry subdomains:  entry "example.com" also blocks "sub.example.com"
+//     (a listed domain covers itself and everything under it — matching how
+//     operators expect a blocklist to behave, e.g. dnsmasq address=/domain/ and
+//     the OISD/hosts convention)
+//   - wildcard subdomains:    entry "*.example.com" blocks "sub.example.com" but
+//     not the apex "example.com" (subdomains-only form)
+//
 // Domain should be in FQDN format (trailing dot, e.g., "example.com.").
 // Matching is case-insensitive.
 func (b *Blocklist) IsBlocked(domain string) bool {
@@ -46,21 +54,20 @@ func (b *Blocklist) IsBlocked(domain string) bool {
 	// Normalize to lowercase and remove trailing dot for matching
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 
-	// Check exact match
+	// Check exact match (bare entry blocking its own apex).
 	if b.domains[domain] {
 		return true
 	}
 
-	// Check wildcard match: *.example.com matches subdomain.example.com
-	// For domain "sub.example.com", check "*.example.com"
+	// Walk parent suffixes once. For "a.b.example.com" this yields
+	// "b.example.com", "example.com", "com" — and at each level we check:
+	//   - a bare entry for that suffix  → bare entry blocks all subdomains
+	//   - "*." + that suffix            → wildcard blocks subdomains (not apex)
 	parts := strings.Split(domain, ".")
-	if len(parts) > 1 {
-		// Check each parent domain
-		for i := 1; i < len(parts); i++ {
-			wildcard := "*." + strings.Join(parts[i:], ".")
-			if b.wildcard[wildcard] {
-				return true
-			}
+	for i := 1; i < len(parts); i++ {
+		suffix := strings.Join(parts[i:], ".")
+		if b.domains[suffix] || b.wildcard["*."+suffix] {
+			return true
 		}
 	}
 
@@ -68,21 +75,26 @@ func (b *Blocklist) IsBlocked(domain string) bool {
 }
 
 // LoadFiles loads blocklists from local files (plain domain list or hosts format).
-// Auto-detects format based on file content.
-func (b *Blocklist) LoadFiles(paths []string) error {
+// Auto-detects format based on file content. Returns the number of lines that
+// were skipped as invalid across all files, so the caller can surface silent
+// drops (0 = every entry loaded cleanly).
+func (b *Blocklist) LoadFiles(paths []string) (skipped int, err error) {
 	for _, path := range paths {
-		if err := b.loadFile(path); err != nil {
-			return fmt.Errorf("load blocklist %s: %w", path, err)
+		n, err := b.loadFile(path)
+		skipped += n
+		if err != nil {
+			return skipped, fmt.Errorf("load blocklist %s: %w", path, err)
 		}
 	}
-	return nil
+	return skipped, nil
 }
 
-// loadFile loads a single blocklist file.
-func (b *Blocklist) loadFile(path string) error {
+// loadFile loads a single blocklist file. Returns the count of skipped
+// (invalid) lines.
+func (b *Blocklist) loadFile(path string) (int, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open file: %w", err)
+		return 0, fmt.Errorf("open file: %w", err)
 	}
 	defer file.Close()
 
@@ -94,13 +106,14 @@ func (b *Blocklist) loadFile(path string) error {
 // Supports:
 // - Plain domain list (one domain per line)
 // - Hosts format (IP domain domain domain...)
-func (b *Blocklist) parseFile(r io.Reader) error {
+func (b *Blocklist) parseFile(r io.Reader) (int, error) {
 	// Scan into temporary local maps — no lock held during the slow I/O scan.
 	// This keeps IsBlocked() uncontested for the full duration of file loading.
 	tmpDomains := make(map[string]bool)
 	tmpWildcard := make(map[string]bool)
-	if err := b.scanInto(r, tmpDomains, tmpWildcard); err != nil {
-		return err
+	skipped, err := b.scanInto(r, tmpDomains, tmpWildcard)
+	if err != nil {
+		return skipped, err
 	}
 
 	// Merge parsed entries into the live maps under a brief lock.
@@ -113,14 +126,17 @@ func (b *Blocklist) parseFile(r io.Reader) error {
 	}
 	b.mu.Unlock()
 
-	return nil
+	return skipped, nil
 }
 
 // scanInto parses one blocklist reader into the provided maps (no lock held).
 // Split out from parseFile so both the merge path (startup) and the replace
 // path (reload) share one scanner/validator. Invalid lines are silently
 // skipped, matching the original loader's tolerant behavior.
-func (b *Blocklist) scanInto(r io.Reader, domains, wildcard map[string]bool) error {
+// Returns the number of non-blank, non-comment lines that were rejected as
+// invalid (bad hostname, or a malformed hosts-format line) — so callers can log
+// silent drops rather than leaving a filtering gap unreported.
+func (b *Blocklist) scanInto(r io.Reader, domains, wildcard map[string]bool) (int, error) {
 	addEntry := func(domain string) {
 		domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 		if strings.HasPrefix(domain, "*.") {
@@ -130,6 +146,7 @@ func (b *Blocklist) scanInto(r io.Reader, domains, wildcard map[string]bool) err
 		}
 	}
 
+	skipped := 0
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -148,20 +165,27 @@ func (b *Blocklist) scanInto(r io.Reader, domains, wildcard map[string]bool) err
 			for _, domain := range fields[1:] {
 				if b.isValidHostname(domain) {
 					addEntry(domain)
+				} else {
+					skipped++
 				}
 			}
 		} else if len(fields) == 1 {
 			// Plain domain list
 			if b.isValidHostname(fields[0]) {
 				addEntry(fields[0])
+			} else {
+				skipped++
 			}
+		} else {
+			// Non-hosts line with multiple fields — malformed, not loadable.
+			skipped++
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan file: %w", err)
+		return skipped, fmt.Errorf("scan file: %w", err)
 	}
-	return nil
+	return skipped, nil
 }
 
 // ReloadResult reports what a ReplaceFromFiles reload loaded, for logging.
@@ -170,6 +194,7 @@ type ReloadResult struct {
 	Wildcards int // wildcard (*.example.com) entries in the new live set
 	FilesOK   int // files scanned without error
 	FilesErr  int // files that failed to open/scan (skipped)
+	Skipped   int // invalid lines dropped across all scanned files
 }
 
 // ReplaceFromFiles rebuilds the entire blocklist from the given files and
@@ -194,12 +219,13 @@ func (b *Blocklist) ReplaceFromFiles(paths []string) (ReloadResult, error) {
 			res.FilesErr++
 			continue
 		}
-		err = b.scanInto(f, newDomains, newWildcard)
+		skipped, err := b.scanInto(f, newDomains, newWildcard)
 		f.Close()
 		if err != nil {
 			res.FilesErr++
 			continue
 		}
+		res.Skipped += skipped
 		res.FilesOK++
 	}
 
@@ -252,16 +278,18 @@ func (b *Blocklist) isValidHostname(host string) bool {
 		return false
 	}
 
-	// RFC 1123: labels can contain alphanumeric and hyphen
-	// Labels cannot start/end with hyphen
+	// Labels can contain alphanumeric, hyphen, and underscore, and cannot
+	// start/end with a hyphen. Underscore is permitted because it is legal in
+	// DNS names (RFC 2181 places no such restriction) and appears in real
+	// blockworthy hosts (service/telemetry labels); rejecting it silently
+	// dropped those entries and left a filtering gap.
 	parts := strings.Split(host, ".")
 	if len(parts) == 0 {
 		return false
 	}
 
-	re := regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 	for _, part := range parts {
-		if !re.MatchString(part) {
+		if !hostLabelRE.MatchString(part) {
 			return false
 		}
 	}
@@ -269,32 +297,39 @@ func (b *Blocklist) isValidHostname(host string) bool {
 	return true
 }
 
+// hostLabelRE matches one DNS label: alphanumeric/underscore body, hyphen
+// allowed internally but not at either end. Compiled once, not per-call.
+var hostLabelRE = regexp.MustCompile(`^[a-zA-Z0-9_]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9_])?$`)
+
 // LoadURLs fetches and loads blocklists from URLs.
 // Respects HTTP timeouts and error handling.
-func (b *Blocklist) LoadURLs(urls []string, timeout time.Duration) error {
+func (b *Blocklist) LoadURLs(urls []string, timeout time.Duration) (skipped int, err error) {
 	client := &http.Client{
 		Timeout: timeout,
 	}
 
 	for _, url := range urls {
-		if err := b.loadURL(client, url); err != nil {
-			return fmt.Errorf("load blocklist from %s: %w", url, err)
+		n, err := b.loadURL(client, url)
+		skipped += n
+		if err != nil {
+			return skipped, fmt.Errorf("load blocklist from %s: %w", url, err)
 		}
 	}
 
-	return nil
+	return skipped, nil
 }
 
-// loadURL fetches a single URL and loads its content.
-func (b *Blocklist) loadURL(client *http.Client, url string) error {
+// loadURL fetches a single URL and loads its content. Returns the count of
+// skipped (invalid) lines.
+func (b *Blocklist) loadURL(client *http.Client, url string) (int, error) {
 	resp, err := client.Get(url)
 	if err != nil {
-		return fmt.Errorf("fetch: %w", err)
+		return 0, fmt.Errorf("fetch: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	return b.parseFile(resp.Body)

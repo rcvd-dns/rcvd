@@ -448,8 +448,8 @@ func main() {
 					go func() {
 						res, _ := dnsBlocklist.ReplaceFromFiles(files)
 						stats.SetBlocklistFiles(res.FilesOK)
-						appLogger.Printf("blocklist: reloaded — %d domains, %d wildcards, %d/%d file(s) OK",
-							res.Domains, res.Wildcards, res.FilesOK, res.FilesOK+res.FilesErr)
+						appLogger.Printf("blocklist: reloaded — %d domains, %d wildcards, %d/%d file(s) OK, %d line(s) skipped",
+							res.Domains, res.Wildcards, res.FilesOK, res.FilesOK+res.FilesErr, res.Skipped)
 					}()
 					return len(files)
 				}
@@ -533,20 +533,25 @@ func main() {
 	if cfg.Blocklists.Enabled {
 		go func() {
 			for _, path := range cfg.Blocklists.Files {
-				if err := dnsBlocklist.LoadFiles([]string{path}); err != nil {
+				skipped, err := dnsBlocklist.LoadFiles([]string{path})
+				if err != nil {
 					appLogger.Printf("blocklist: error loading %s: %v", path, err)
 					continue
 				}
-				appLogger.Printf("blocklist: loaded %s", path)
+				if skipped > 0 {
+					appLogger.Printf("blocklist: loaded %s (%d invalid line(s) skipped)", path, skipped)
+				} else {
+					appLogger.Printf("blocklist: loaded %s", path)
+				}
 				if stats != nil {
 					stats.AddBlocklistFile()
 				}
 			}
 			if len(cfg.Blocklists.UpdateURLs) > 0 {
-				if err := dnsBlocklist.LoadURLs(cfg.Blocklists.UpdateURLs, 30*time.Second); err != nil {
+				if skipped, err := dnsBlocklist.LoadURLs(cfg.Blocklists.UpdateURLs, 30*time.Second); err != nil {
 					appLogger.Printf("blocklist: error loading URLs: %v", err)
 				} else {
-					appLogger.Printf("blocklist: loaded %d URL source(s)", len(cfg.Blocklists.UpdateURLs))
+					appLogger.Printf("blocklist: loaded %d URL source(s) (%d invalid line(s) skipped)", len(cfg.Blocklists.UpdateURLs), skipped)
 					if stats != nil {
 						for range cfg.Blocklists.UpdateURLs {
 							stats.AddBlocklistFile()
