@@ -42,19 +42,46 @@ type ResolverConfig struct {
 //	                  (Firefox/Zen DoH/TRR REQUIRES a CA-trusted cert and ignores self-signed
 //	                  exceptions) and any public endpoint. Needs a real domain + DNS-01/HTTP-01.
 //	tls_cert/tls_key— bring-your-own cert (Tailscale `tailscale cert`, corporate CA, etc.).
-//	tls_cert_autogen— self-signed. For DEV/TEST (curl -k, local validation) OR behind a
-//	                  TLS-terminating proxy that doesn't verify upstream (the Quick Tunnel /
-//	                  nginx-sidecar pattern, where the proxy presents the real cert to clients).
-//	                  DOES NOT WORK for direct browser DoH — the browser will refuse it.
+//	                  Also the right choice for a PINNED leg: a stable file-based cert keeps the
+//	                  SPKI constant across restarts, so a client's pinned_pubkey keeps matching.
+//	                  Self-signed is fine here — a pinned client verifies the SPKI, not a CA chain.
+//	tls_cert_autogen— self-signed AND regenerated at every start. For DEV/TEST (curl -k, local
+//	                  validation, the container suite) OR behind a TLS-terminating proxy that
+//	                  doesn't verify upstream (the Quick Tunnel / nginx-sidecar pattern, where the
+//	                  proxy presents the real cert to clients).
+//	                  Does NOT work for direct browser DoH — the browser refuses it and falls back
+//	                  silently (no exception prompt on the DoH/TRR path). Same for native mobile
+//	                  DNS clients (iOS DNSecure, Android Private DNS), which have no exception UI
+//	                  at all: a self-signed endpoint is simply unreachable to them.
+//	                  Also INCOMPATIBLE WITH SPKI PINNING: a per-start key means a per-start SPKI,
+//	                  so every pinned client breaks on the next restart. Validate() rejects the
+//	                  combination when it is detectable (see the check in validate()).
 type UpstreamConfig struct {
-	Enabled        bool   `toml:"enabled"`
-	ListenDoH      string `toml:"listen_doh"`       // e.g., 0.0.0.0:8443
-	DoH3           bool   `toml:"doh3"`             // also serve DoH3 (HTTP/3 over QUIC/UDP) on the ListenDoH addr
-	ListenDoT      string `toml:"listen_dot"`       // e.g., 0.0.0.0:853
-	ListenDoQ      string `toml:"listen_doq"`       // e.g., 0.0.0.0:853
-	TLSCert        string `toml:"tls_cert"`         // bring-your-own cert file (with tls_key)
-	TLSKey         string `toml:"tls_key"`          // bring-your-own key file (with tls_cert)
-	TLSCertAutoGen bool   `toml:"tls_cert_autogen"` // self-signed: dev/test OR behind a trust-terminating proxy; NOT direct-browser
+	Enabled   bool   `toml:"enabled"`
+	ListenDoH string `toml:"listen_doh"` // e.g., 0.0.0.0:8443
+	DoH3      bool   `toml:"doh3"`       // also serve DoH3 (HTTP/3 over QUIC/UDP) on the ListenDoH addr
+	ListenDoT string `toml:"listen_dot"` // e.g., 0.0.0.0:853
+	ListenDoQ string `toml:"listen_doq"` // e.g., 0.0.0.0:853
+	// AdvertiseIPs are the public addresses clients reach this instance at, published as the
+	// ipv4hint/ipv6hint of every DDR (RFC 9462) SVCB record rcvd serves for _dns.resolver.arpa.
+	// One setting covers all listeners: the hints describe the host, and every designation
+	// (DoH, DoT, DoQ) points at that same host.
+	//
+	// Needed because a wildcard bind (0.0.0.0 / ::) carries no address to advertise, and rcvd
+	// cannot learn its own public address from the socket — behind NAT or an Elastic IP the
+	// bind address is not what the client dials. When the bind IS a concrete IP literal, that
+	// address is used automatically and this field is redundant.
+	//
+	// Set it for any wildcard-bound endpoint that mobile clients discover via DDR: Android's
+	// native resolver requires the hints. It reads the SVCB and dials hint[0] directly — it
+	// never resolves the SVCB Target name — so a hintless record is rejected outright and the
+	// OS silently falls back to DoT on :853 (AOSP PrivateDnsConfiguration.cpp makeDohIdentity:
+	// `!dohParams->ips.empty()` gates the DoH upgrade). Accepts IPv4 and IPv6 literals; both
+	// families should be listed on a dual-stack endpoint (Android sorts to prefer IPv6).
+	AdvertiseIPs   []string `toml:"advertise_ips"`
+	TLSCert        string   `toml:"tls_cert"`         // bring-your-own cert file (with tls_key)
+	TLSKey         string   `toml:"tls_key"`          // bring-your-own key file (with tls_cert)
+	TLSCertAutoGen bool     `toml:"tls_cert_autogen"` // self-signed, NEW KEY EVERY START: dev/test or behind a trust-terminating proxy; not direct-browser, not mobile, not compatible with SPKI pinning
 	// TLSCertHosts adds extra hostnames/IPs to the self-signed (tls_cert_autogen) cert's SAN,
 	// on top of the auto-derived listen-address hosts + loopback. Use it when clients connect by
 	// a name that isn't the bind address — e.g. a tunnel hostname (doh-dev.rcvd.net) or a LAN
@@ -223,7 +250,7 @@ type TLSAutomationConfig struct {
 	// precedence: setting more than one of these is a hard config error. This keeps
 	// "where did the secret come from" unambiguous from day one.
 	//
-	// SECURITY: scope the token to a single zone (Zone:DNS:Edit) where possible.
+	// Security: scope the token to a single zone (Zone:DNS:Edit) where possible.
 	// Prefer _env or _file (0600) over the inline literal in production / IaC.
 
 	// DNSAPIToken — source 1: the token inline in the config file. Simplest for
@@ -253,9 +280,9 @@ type TLSAutomationConfig struct {
 
 // SupportedDNSProviders is the single source of truth for which libdns DNS-01
 // providers rcvd accepts. config.Validate() rejects any other dns_provider at
-// load time, and rcvd_tls.newDNS01Solver constructs the matching provider; both
+// load time, and rcvd_tls.newNoCleartextDNS01Solver constructs the matching provider; both
 // reference this list so they cannot drift. Add a provider here AND add its case
-// in newDNS01Solver. MVP: cloudflare only.
+// in newNoCleartextDNS01Solver. MVP: cloudflare only.
 var SupportedDNSProviders = []string{"cloudflare"}
 
 // IsSupportedDNSProvider reports whether name is an accepted libdns provider.
@@ -269,7 +296,26 @@ func IsSupportedDNSProvider(name string) bool {
 }
 
 // Load parses a TOML config file and returns a validated Config.
+// Load reads, parses, and fully validates the config for the daemon path. It
+// materializes the DNS-01 token from its configured source and fails loudly if
+// that source is missing — the daemon must not start a tls_automation config it
+// cannot actually issue certs for.
 func Load(path string) (*Config, error) {
+	return load(path, true)
+}
+
+// LoadForDiagnostics is Load for the read-only verbs (--verify-self,
+// --verify-upstream, --verify-pin, --show-pin). Those inspect listeners/upstreams
+// and never issue certificates, so they must not require the ACME DNS-01 token to
+// be present in the caller's environment. It performs identical parsing and
+// validation EXCEPT it skips materializing the DNS-01 token (and the matching
+// "a token must be resolved" assertion), so an operator can run a self-check
+// against a tls_automation config without exporting a secret into their shell.
+func LoadForDiagnostics(path string) (*Config, error) {
+	return load(path, false)
+}
+
+func load(path string, materializeToken bool) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -320,12 +366,17 @@ func Load(path string) (*Config, error) {
 	// file) into DNSAPIToken, so the rest of rcvd consumes one field regardless of
 	// source. Done before Validate so Validate sees the materialized token.
 	// Relative dns_api_token_file is resolved against the config file's directory.
-	if err := cfg.resolveDNSAPIToken(filepath.Dir(path)); err != nil {
-		return nil, err
+	// Skipped for the diagnostics path, which never issues certs and so must not
+	// require the token to be present (see LoadForDiagnostics).
+	if materializeToken {
+		if err := cfg.resolveDNSAPIToken(filepath.Dir(path)); err != nil {
+			return nil, err
+		}
 	}
 
-	// Validate the configuration
-	if err := cfg.Validate(); err != nil {
+	// Validate the configuration. requireToken mirrors materializeToken: when we
+	// did not materialize a token, we also must not assert one was resolved.
+	if err := cfg.validate(materializeToken); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
@@ -440,7 +491,16 @@ func tokenFromDotenv(path, key string) (string, error) {
 }
 
 // Validate checks for mutual-exclusion and required fields.
+// Validate runs the full config validation, including the assertion that a
+// DNS-01 token was resolved when tls_automation uses the dns01 challenge.
 func (c *Config) Validate() error {
+	return c.validate(true)
+}
+
+// validate is Validate with a knob for the diagnostics path: when requireToken
+// is false, the DNS-01 "a token must be resolved" check is skipped (the token is
+// never materialized for read-only verbs). All other validation is identical.
+func (c *Config) validate(requireToken bool) error {
 	// At least one mode must be enabled
 	if !c.Resolver.Enabled && !c.UpstreamService.Enabled {
 		return fmt.Errorf("at least one mode must be enabled (resolver or upstream_service)")
@@ -520,10 +580,73 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Mode 2: advertise_ips feeds the DDR (RFC 9462) SVCB ipv4hint/ipv6hint, and a
+	// discovering client DIALS those addresses directly rather than resolving the
+	// SVCB Target. A typo therefore does not degrade gracefully — it points every
+	// discovering client at the wrong host — so reject anything that is not an IP
+	// literal at load. Hostnames are rejected on purpose: SVCB hints are address
+	// records by definition (RFC 9460 §7.3), and accepting a name here would imply
+	// a resolution step that never happens.
+	if len(c.UpstreamService.AdvertiseIPs) > 0 {
+		if !c.UpstreamService.Enabled {
+			return fmt.Errorf("upstream_service: advertise_ips set but upstream_service is not enabled")
+		}
+		if c.UpstreamService.ListenDoH == "" && c.UpstreamService.ListenDoT == "" &&
+			c.UpstreamService.ListenDoQ == "" {
+			return fmt.Errorf("upstream_service: advertise_ips set but no encrypted listener is " +
+				"configured (listen_doh/listen_dot/listen_doq all empty) — the hints describe an " +
+				"endpoint clients connect to, and there is none")
+		}
+		for i, addr := range c.UpstreamService.AdvertiseIPs {
+			ip := net.ParseIP(addr)
+			if ip == nil {
+				return fmt.Errorf("upstream_service: advertise_ips[%d] %q is not a valid IP address "+
+					"(must be an IPv4 or IPv6 literal, not a hostname — SVCB hints are addresses)", i, addr)
+			}
+			if ip.IsUnspecified() {
+				return fmt.Errorf("upstream_service: advertise_ips[%d] %q is the unspecified address — "+
+					"advertise the public address clients dial, not a wildcard", i, addr)
+			}
+		}
+	}
+
+	// Mode 2: tls_cert_autogen generates a fresh key pair on every start, so the
+	// server's SPKI hash changes at every restart. Any client that pins this
+	// instance (pinned_pubkey, RFC 7469-style SPKI pin) therefore breaks the next
+	// time rcvd restarts — the pin was computed against a key that no longer
+	// exists. The failure is nasty because it is delayed: everything works until a
+	// reboot, then every pinned client fails TLS at once, which looks like a
+	// network or cert-expiry problem rather than a config choice made months ago.
+	//
+	// A pin against THIS instance lives in the CLIENT's config, so it cannot be
+	// seen from here in the general case. What is detectable is the same-host
+	// case: this process serves Mode 2 with an autogen cert while also pinning an
+	// upstream. That is the dual-mode router/laptop shape, and it is a strong
+	// signal the operator is in a pinning deployment and wants a stable key.
+	//
+	// The fix is a stable file-based cert (tls_cert/tls_key) — it may still be
+	// self-signed, which is fine: a pinned client authenticates by SPKI, not by CA
+	// chain. Self-signed is not the problem; a key that moves is.
+	if c.UpstreamService.Enabled && c.UpstreamService.TLSCertAutoGen {
+		for i, up := range c.Upstreams {
+			if up.PinnedPubKey == "" {
+				continue
+			}
+			return fmt.Errorf(
+				"upstream_service: tls_cert_autogen = true is incompatible with SPKI pinning "+
+					"(upstream[%d] %q sets pinned_pubkey): autogen creates a new key at every start, "+
+					"so the served SPKI changes on restart and any client pinning this instance breaks. "+
+					"Use a stable file-based cert instead (tls_cert + tls_key) — self-signed is fine, "+
+					"pinned clients verify the SPKI, not a CA chain — or tls_automation for a real CA cert",
+				i, up.Name,
+			)
+		}
+	}
+
 	// TLS automation: validate the ACME challenge + DNS-01 provider/token at load
 	// time so a typo'd dns_provider or a missing token fails at startup, not lazily
 	// when the first certificate is requested.
-	if err := c.validateTLSAutomation(); err != nil {
+	if err := c.validateTLSAutomation(requireToken); err != nil {
 		return err
 	}
 
@@ -581,7 +704,7 @@ func (c *Config) Validate() error {
 // env/file materialization happen earlier in resolveDNSAPIToken (Load); this is
 // the load-time fail-fast for challenge/provider so a misconfig errors at startup
 // rather than lazily at first certificate issuance.
-func (c *Config) validateTLSAutomation() error {
+func (c *Config) validateTLSAutomation(requireToken bool) error {
 	t := &c.TLSAutomation
 	challenge := t.Challenge
 
@@ -609,8 +732,9 @@ func (c *Config) validateTLSAutomation() error {
 			t.DNSProvider, strings.Join(SupportedDNSProviders, ", "))
 	}
 
-	// A token must have been resolved (from any of the three sources).
-	if t.DNSAPIToken == "" {
+	// A token must have been resolved (from any of the three sources). Skipped on
+	// the diagnostics path, which never materializes the token (see validate).
+	if requireToken && t.DNSAPIToken == "" {
 		return fmt.Errorf(
 			"tls_automation: challenge = \"dns01\" requires a token — set exactly one of " +
 				"dns_api_token, dns_api_token_env, or dns_api_token_file")

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,12 @@ type TLSResolver struct {
 	// Connection pooling
 	mu   sync.Mutex
 	conn *tls.Conn
+
+	// exchMu serializes a whole write→read exchange on the single pooled conn.
+	// The DoT pool holds exactly one connection with no in-flight ID demux, so
+	// two concurrent queries would otherwise interleave their writes/reads and
+	// read each other's replies (the "question does not match query" symptom).
+	exchMu sync.Mutex
 }
 
 // NewTLSResolver creates a new DoT resolver.
@@ -60,10 +67,15 @@ func (t *TLSResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, erro
 	if t.stats != nil {
 		atomic.AddInt64(&t.stats.DoTQueries, 1)
 	}
+	// Capture pooled-ness BEFORE the first attempt: resolveOnce discards the
+	// connection on every error path (broken pipe, EOF, short read, ID mismatch),
+	// so checking t.isPooled() afterwards is always false and the retry never
+	// fires. A pooled conn can go stale server-side after an idle gap (Mullvad
+	// closes idle DoT conns); with a single upstream that first dead-conn write
+	// is instantly "all upstreams failed" → SERVFAIL. Retry once on a fresh dial.
+	pooledBefore := t.isPooled()
 	resp, err := t.resolveOnce(ctx, msg)
-	if err != nil && t.isPooled() {
-		// Pooled connection was stale — discard and retry once on a fresh connection
-		t.closeConnection()
+	if err != nil && pooledBefore {
 		return t.resolveOnce(ctx, msg)
 	}
 	return resp, err
@@ -78,6 +90,11 @@ func (t *TLSResolver) isPooled() bool {
 
 // resolveOnce performs a single DNS query over TLS.
 func (t *TLSResolver) resolveOnce(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	// One in-flight exchange per pooled conn (see exchMu). Held across the whole
+	// write→read so concurrent queries can't cross-wire on the shared connection.
+	t.exchMu.Lock()
+	defer t.exchMu.Unlock()
+
 	conn, err := t.getConnection(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("DoT connection: %w", err)
@@ -100,9 +117,10 @@ func (t *TLSResolver) resolveOnce(ctx context.Context, msg *dns.Msg) (*dns.Msg, 
 		return nil, fmt.Errorf("DoT write msg: %w", err)
 	}
 
-	// Read response length
+	// Read response length. io.ReadFull, not conn.Read: a split TCP segment can
+	// deliver fewer than 2 bytes on a single Read, which would misparse the length.
 	lengthBuf := make([]byte, 2)
-	if _, err := conn.Read(lengthBuf); err != nil {
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
 		t.closeConnection()
 		return nil, fmt.Errorf("DoT read length: %w", err)
 	}
@@ -113,9 +131,9 @@ func (t *TLSResolver) resolveOnce(ctx context.Context, msg *dns.Msg) (*dns.Msg, 
 		return nil, fmt.Errorf("DoT invalid response length: %d", respLen)
 	}
 
-	// Read DNS response
+	// Read DNS response (io.ReadFull to handle a body split across TCP segments)
 	respBuf := make([]byte, respLen)
-	if _, err := conn.Read(respBuf); err != nil {
+	if _, err := io.ReadFull(conn, respBuf); err != nil {
 		t.closeConnection()
 		return nil, fmt.Errorf("DoT read msg: %w", err)
 	}
@@ -125,6 +143,16 @@ func (t *TLSResolver) resolveOnce(ctx context.Context, msg *dns.Msg) (*dns.Msg, 
 	if err := resp.Unpack(respBuf); err != nil {
 		t.closeConnection()
 		return nil, fmt.Errorf("DoT unpack: %w", err)
+	}
+
+	// Response-ID sanity check: a mismatch means the pooled conn is out of sync
+	// (a stale reply from an earlier query is buffered ahead of ours). Discard
+	// the conn so the retry in Resolve gets a clean dial. Cheap correlation
+	// defense in the spirit of the Issue 31 DoQ fix; the fallback layer's
+	// question-match check remains the outer guard.
+	if resp.Id != msg.Id {
+		t.closeConnection()
+		return nil, fmt.Errorf("DoT response ID mismatch: got %d, want %d", resp.Id, msg.Id)
 	}
 
 	return resp, nil

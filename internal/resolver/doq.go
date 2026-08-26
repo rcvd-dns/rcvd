@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
+	"github.com/rcvd-dns/rcvd/internal/logger"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
 )
 
@@ -31,7 +31,7 @@ type DoQResolver struct {
 	port     int
 	pin      string            // optional SPKI pin ("sha256//..."); "" = normal CA validation
 	stats    *statistics.Stats // optional, nil if stats disabled
-	logger   *log.Logger       // optional, nil = no retry-path logging (Issue 31)
+	logger   *logger.Logger    // optional, nil = no retry-path logging (Issue 31)
 
 	// TLS session resumption cache (RFC 9250 §5.5.3). Created once and reused
 	// across dials so re-connections after idle-close resume at 1-RTT instead of
@@ -62,16 +62,32 @@ func NewDoQResolver(host, dialHost string, port int, pin string, stats *statisti
 	}
 }
 
-// SetLogger wires an optional logger for retry-path diagnostics (Issue 31). When set,
-// a retried exchange logs which failure triggered the retry — an idle-gap read failure
-// (benign, expected) vs. a response-question mismatch (rare, signals cross-wiring). Kept
-// off the constructor so existing callers/tests are undisturbed; nil = silent.
-func (q *DoQResolver) SetLogger(l *log.Logger) { q.logger = l }
+// SetLogger wires an optional leveled logger for retry-path diagnostics (Issue 31). When
+// set, a retried exchange records which failure triggered the retry — an idle-gap read
+// failure (benign, expected) vs. a response-question mismatch (rare, signals cross-wiring).
+// Kept off the constructor so existing callers/tests are undisturbed; nil = silent.
+func (q *DoQResolver) SetLogger(l *logger.Logger) { q.logger = l }
 
-// logRetry emits one retry-path line if a logger is wired. cause is the classified reason.
-func (q *DoQResolver) logRetry(cause string, err error) {
+// logIdleRetry records a benign idle-gap recovery: bump the DoQIdleRetries counter (always,
+// so --stats shows recovery frequency) and emit the per-event line only at DEBUG. On a
+// bursty/roaming leg this fires often and was flooding the daemon log at info level — it is
+// a successful recovery, never a SERVFAIL, so info stays quiet and an operator opts into the
+// detail with [logging] level = "debug".
+func (q *DoQResolver) logIdleRetry(err error) {
+	if q.stats != nil {
+		atomic.AddInt64(&q.stats.DoQIdleRetries, 1)
+	}
 	if q.logger != nil {
-		q.logger.Printf("DoQ retry: %s — %v", cause, err)
+		q.logger.Debugf("DoQ retry: stale-conn read failure (idle gap) — %v", err)
+	}
+}
+
+// logMismatchRetry records the rare, serious case — a response whose question does not match
+// the query (residual cross-wiring). Always logged (info), regardless of level: this is never
+// expected and an operator should always see it.
+func (q *DoQResolver) logMismatchRetry(err error) {
+	if q.logger != nil {
+		q.logger.Infof("DoQ retry: response question mismatch (rare — investigate cross-wiring) — %v", err)
 	}
 }
 
@@ -100,12 +116,13 @@ func (q *DoQResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, erro
 		return nil, err
 	}
 
-	// Classify for the log: a question mismatch is rare and signals residual cross-wiring;
-	// everything else here is the benign idle-gap read failure we expect under load.
+	// Classify for the log: a question mismatch is rare and signals residual cross-wiring
+	// (always logged); everything else here is the benign idle-gap read failure we expect
+	// under load (counted always, logged only at debug).
 	if err != nil && err == errDoQQuestionMismatch {
-		q.logRetry("response question mismatch (rare — investigate cross-wiring)", err)
+		q.logMismatchRetry(err)
 	} else {
-		q.logRetry("stale-conn read failure (idle gap)", err)
+		q.logIdleRetry(err)
 	}
 
 	// One retry on a guaranteed-fresh connection.
@@ -233,6 +250,15 @@ func (q *DoQResolver) exchangeOnce(ctx context.Context, msg *dns.Msg) (*dns.Msg,
 	if !doqResponseMatchesQuery(msg, resp) {
 		q.recycleConn(conn)
 		return nil, true, errDoQQuestionMismatch
+	}
+
+	// Reject a truncated or degraded-empty response (Issue 31, empty-answer-on-retry). Both
+	// are ways a stale-conn retry hands back a frame that parses and echoes the question but
+	// carries no usable answer — relaying it reaches the client as an address-less "success".
+	// Retryable, so the exchange re-asks on a fresh connection; a legitimate NODATA passes.
+	if err := doqResponseUsable(resp); err != nil {
+		q.recycleConn(conn)
+		return nil, true, err
 	}
 
 	// Update last-used time for idle timeout tracking
@@ -374,6 +400,46 @@ func doqResponseMatchesQuery(query, resp *dns.Msg) bool {
 	return a.Qtype == b.Qtype &&
 		a.Qclass == b.Qclass &&
 		dns.CanonicalName(a.Name) == dns.CanonicalName(b.Name)
+}
+
+// errDoQTruncated / errDoQEmptyNoSOA mark the two degraded-response rejections so the retry
+// path and tests can identify them. Sentinels — callers compare identity, not chains.
+var (
+	// A DoQ response must never be truncated (RFC 9250 §4.3: the TC bit is always 0 over DoQ;
+	// QUIC streams carry a full message, so truncation is a hard protocol error, not a signal
+	// to retry over TCP as it would be over UDP).
+	errDoQTruncated = fmt.Errorf("DoQ truncated response (RFC 9250 §4.3: TC must be 0)")
+	// A NOERROR answer with zero records and no SOA in the authority section is a degraded
+	// response, not a real NODATA: RFC 2308 §5 requires the SOA that scopes negative caching,
+	// and a genuine empty answer for a name that has records (e.g. github.com/A) never looks
+	// like this. Under a stale-conn retry this is how an emptied frame slips through as success.
+	errDoQEmptyNoSOA = fmt.Errorf("DoQ empty NOERROR without SOA (degraded response)")
+)
+
+// doqResponseUsable reports whether resp is a well-formed DoQ answer safe to relay, or a
+// classified error when it is a truncated / degraded-empty frame that must be retried on a
+// fresh connection instead (Issue 31, empty-answer-on-retry). Pure logic so the guard is
+// testable without a live QUIC handshake, mirroring doqResponseMatchesQuery.
+func doqResponseUsable(resp *dns.Msg) error {
+	if resp.Truncated {
+		return errDoQTruncated
+	}
+	if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 && !hasSOA(resp.Ns) {
+		return errDoQEmptyNoSOA
+	}
+	return nil
+}
+
+// hasSOA reports whether the authority section carries an SOA record — the marker of a
+// real negative answer (NODATA/NXDOMAIN) per RFC 2308 §5. Used to tell a legitimate empty
+// answer from a degraded/emptied one that must not be relayed as success.
+func hasSOA(ns []dns.RR) bool {
+	for _, rr := range ns {
+		if _, ok := rr.(*dns.SOA); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Close closes the resolver and any open connections.

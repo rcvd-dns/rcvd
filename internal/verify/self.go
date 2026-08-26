@@ -24,14 +24,19 @@ import (
 // self-signed cert, a certmagic/ACME cert materialized on first handshake, or a
 // bring-your-own `tls_cert`/`tls_key`. Reading config or files cannot reveal the first two.
 //
-// serverNameOverride sets the TLS SNI for the probe; when empty, the SNI is derived from each
-// listener's configured host (falling back to "localhost", which the autogen SAN always
-// covers). certmagic on-demand only issues for an allowed domain, so a real public deployment
-// should pass its DoH hostname via the override to exercise the on-demand path.
+// serverNameOverride sets the TLS SNI for the probe. Precedence when it is empty: the DoH
+// listener falls back to the first tls_automation hostname (dohHostname, from allowed_domains)
+// when its bind is an IP — so a real public deployment probes the actual cert (e.g.
+// doh-dev.rcvd.net) instead of the "localhost" autogen SAN, with no need to remember
+// -server-name. Absent both, the SNI is derived from the listener's configured host (falling
+// back to "localhost", which the autogen SAN always covers).
+//
+// dohHostname is the configured DoH hostname (tls_automation allowed_domains[0], or "") — it is
+// both reported in the header and used as the DoH SNI default described above.
 //
 // Returns the formatted report and a bool that is true only if every probed endpoint
 // succeeded (TLS handshake completed and a leaf cert was presented).
-func VerifySelf(ctx context.Context, configPath string, cfg *config.UpstreamConfig, serverNameOverride string) (string, bool) {
+func VerifySelf(ctx context.Context, configPath string, cfg *config.UpstreamConfig, serverNameOverride, dohHostname string) (string, bool) {
 	if !cfg.Enabled {
 		return "RCVD Self (Mode-2) TLS Verification\n" +
 			fmt.Sprintf("  Config: %s\n\n", configPath) +
@@ -50,7 +55,14 @@ func VerifySelf(ctx context.Context, configPath string, cfg *config.UpstreamConf
 	for _, ep := range endpoints {
 		serverName := serverNameOverride
 		if serverName == "" {
-			serverName = ep.sni
+			// For DoH, prefer the configured tls_automation hostname over the
+			// IP-derived "localhost" default so we handshake as the name the real
+			// cert is issued for. DoT/DoQ keep the listener-derived SNI.
+			if ep.protocol == "DoH" && dohHostname != "" {
+				serverName = dohHostname
+			} else {
+				serverName = ep.sni
+			}
 		}
 
 		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -75,7 +87,7 @@ func VerifySelf(ctx context.Context, configPath string, cfg *config.UpstreamConf
 		}
 	}
 
-	return formatSelfResults(configPath, results), allOK
+	return formatSelfResults(configPath, dohHostname, results), allOK
 }
 
 // probeSelf performs a TLS handshake against THIS instance's own listener and returns the cert
@@ -183,11 +195,14 @@ func selfEndpoints(cfg *config.UpstreamConfig) []selfEndpoint {
 // formatSelfResults renders the self-verification report. It reuses the per-cert detail layout
 // of the upstream report but frames the summary inward ("what I present") and adds an explicit
 // self-signed-vs-CA classification — the single most useful line for a Mode-2 operator.
-func formatSelfResults(configPath string, results []UpstreamResult) string {
+func formatSelfResults(configPath, dohHostname string, results []UpstreamResult) string {
 	var b strings.Builder
 
 	b.WriteString("RCVD Self (Mode-2) TLS Verification\n")
 	fmt.Fprintf(&b, "  Config: %s\n", configPath)
+	if dohHostname != "" {
+		fmt.Fprintf(&b, "  DoH hostname: %s (from tls_automation; used as the DoH SNI unless -server-name is given)\n", dohHostname)
+	}
 	b.WriteString("  Probes THIS instance's listeners for the cert it presents to clients.\n")
 	b.WriteByte('\n')
 

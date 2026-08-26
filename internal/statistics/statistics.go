@@ -48,6 +48,12 @@ type Stats struct {
 	DoTQueries int64
 	DoHQueries int64
 
+	// DoQ idle-gap recoveries: a reused DoQ connection was found stale (peer closed it
+	// at its idle timeout) and the exchange re-dialed on a fresh connection and succeeded.
+	// Benign and expected on a bursty/roaming leg — counted so operators can see recovery
+	// frequency without the per-event log line (which is debug-only). Never a SERVFAIL.
+	DoQIdleRetries int64
+
 	// Per-protocol (upstream service, Mode 2 inbound)
 	DoQServed int64
 	DoTServed int64
@@ -116,6 +122,7 @@ type Snapshot struct {
 	DoQQueries           int64
 	DoTQueries           int64
 	DoHQueries           int64
+	DoQIdleRetries       int64
 	DoQServed            int64
 	DoTServed            int64
 	DoHServed            int64
@@ -282,6 +289,7 @@ func (s *Stats) TakeSnapshot(cacheSize, cacheMaxSize int, info InstanceInfo) Sna
 		DoQQueries:           atomic.LoadInt64(&s.DoQQueries),
 		DoTQueries:           atomic.LoadInt64(&s.DoTQueries),
 		DoHQueries:           atomic.LoadInt64(&s.DoHQueries),
+		DoQIdleRetries:       atomic.LoadInt64(&s.DoQIdleRetries),
 		DoQServed:            atomic.LoadInt64(&s.DoQServed),
 		DoTServed:            atomic.LoadInt64(&s.DoTServed),
 		DoHServed:            atomic.LoadInt64(&s.DoHServed),
@@ -457,6 +465,18 @@ func (snap *Snapshot) Render(version string) string {
 			b.WriteString("      adds this instance's own upstream fetch (see Mode-1 \"Miss latency\") —\n")
 			b.WriteString("      which is why max can spike while a warm avg stays low.\n")
 		}
+		b.WriteByte('\n')
+	}
+
+	// ---- DoQ TRANSPORT (mode-independent) ------------------------------------
+	// Idle-gap recoveries: a pooled DoQ connection was found stale (peer closed it at
+	// its idle timeout) and the exchange re-dialed and succeeded. Benign and expected on
+	// a bursty/roaming leg — every one recovered (never a SERVFAIL). Shown only when
+	// non-zero so a quiet install prints nothing. The per-event line is debug-only.
+	if snap.DoQIdleRetries > 0 {
+		b.WriteString("DoQ TRANSPORT\n")
+		fmt.Fprintf(&b, "    %*s %s   idle-gap re-dials, all recovered (per-event log at debug)\n",
+			w, "Idle retries:", fmtInt(snap.DoQIdleRetries))
 		b.WriteByte('\n')
 	}
 

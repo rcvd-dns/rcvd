@@ -154,7 +154,7 @@ func main() {
 	}
 
 	if *verifyUpstream {
-		cfg, err := config.Load(*configPath)
+		cfg, err := config.LoadForDiagnostics(*configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 			os.Exit(1)
@@ -168,7 +168,7 @@ func main() {
 	}
 
 	if *showPin >= 0 {
-		cfg, err := config.Load(*configPath)
+		cfg, err := config.LoadForDiagnostics(*configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 			os.Exit(1)
@@ -186,7 +186,7 @@ func main() {
 	}
 
 	if *verifyPin {
-		cfg, err := config.Load(*configPath)
+		cfg, err := config.LoadForDiagnostics(*configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 			os.Exit(1)
@@ -200,12 +200,19 @@ func main() {
 	}
 
 	if *verifySelf {
-		cfg, err := config.Load(*configPath)
+		cfg, err := config.LoadForDiagnostics(*configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 			os.Exit(1)
 		}
-		output, allOK := verify.VerifySelf(context.Background(), *configPath, &cfg.UpstreamService, *serverName)
+		// The DoH hostname is the cert's subject — the first tls_automation allowed_domains
+		// entry (both modes populate it). Passed so --verify-self can report it and default
+		// the DoH SNI to it (instead of the IP-derived "localhost" autogen).
+		var dohHostname string
+		if len(cfg.TLSAutomation.AllowedDomains) > 0 {
+			dohHostname = cfg.TLSAutomation.AllowedDomains[0]
+		}
+		output, allOK := verify.VerifySelf(context.Background(), *configPath, &cfg.UpstreamService, *serverName, dohHostname)
 		fmt.Print(output)
 		if !allOK {
 			os.Exit(1)
@@ -516,6 +523,9 @@ func main() {
 			appLogger.Printf("error: upstream service: %v", err)
 			os.Exit(1)
 		}
+		// Route the DoQ listener's benign-idle server-side lines (client-closed write, idle
+		// accept close) through the leveled logger so they log at debug, not unconditionally.
+		upstreamSvc.SetDebugLogger(appLogger)
 
 		// Start upstream service
 		if err := upstreamSvc.Start(context.Background()); err != nil {
@@ -642,7 +652,7 @@ func buildUpstreamChain(upstreams []config.UpstreamServer, stats *statistics.Sta
 			// Wire the retry-path logger (Issue 31): distinguishes benign idle-gap retries
 			// from rare response-question mismatches in the daemon log.
 			if appLogger != nil {
-				doqResolver.SetLogger(appLogger.Logger)
+				doqResolver.SetLogger(appLogger)
 			}
 			chain = append(chain, &resolver.UpstreamState{
 				Name:     baseName + " (DoQ)",

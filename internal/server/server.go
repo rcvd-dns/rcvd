@@ -238,8 +238,33 @@ func stripOPT(msg *dns.Msg) {
 // the server is not EDNS/DNSSEC-capable, DOWNGRADES its feature set, and retries —
 // burning a ~5s feature-detection timer on every lookup (Issue 28). Echoing an OPT
 // with DO set tells resolved "yes, I speak EDNS0 + DNSSEC," so it stops downgrading.
-func ensureResponseEDNS(response *dns.Msg, clientDO bool) {
+// RFC 6891 6.1.1 also cuts the other way: a requestor that sent NO OPT (a non-EDNS query)
+// must receive a NON-EDNS response — no OPT at all. rcvd previously always appended an OPT even
+// to a non-EDNS query; strict mobile native-DoH stacks (iOS 18 DNSecure, modern Android) break on
+// that unsolicited OPT and refuse the resolver (Issue 36), while Google/Quad9/AdGuard omit it and
+// work. So we key off the query's OPT presence, not just its DO bit.
+func ensureResponseEDNS(response, query *dns.Msg) {
 	if response == nil {
+		return
+	}
+	queryOPT := query.IsEdns0()
+	clientDO := queryOPT != nil && queryOPT.Do()
+	// A client that did not set DO must not receive DNSSEC records (RFC 6840 §5.9).
+	// We always query upstream with DO=1 (queryWithDO) so our validator has RRSIGs, so
+	// an upstream reply for a signed zone carries RRSIG/NSEC/NSEC3 that a non-DO stub never
+	// asked for. Setting the OPT's DO bit down (below) is not enough on its own — the records
+	// must go too, or a stub that trusts the DO bit gets confused. macOS mDNSResponder in
+	// particular stalls ~60s on such a response (Issue 34); systemd-resolved (Issue 28) is more
+	// forgiving but still should not see them. Validation already happened (applyDNSSEC); the AD
+	// bit we set there is preserved — only the signature records are dropped.
+	if !clientDO {
+		stripDNSSECRecords(response)
+	}
+	// Non-EDNS query -> non-EDNS response: strip any OPT the upstream/validator left behind and
+	// do not add one (RFC 6891 6.1.1; Issue 36). We always dial upstream with DO=1, so the
+	// response can carry an OPT the client never asked for — remove it here.
+	if queryOPT == nil {
+		stripOPT(response)
 		return
 	}
 	opt := response.IsEdns0()
@@ -251,6 +276,34 @@ func ensureResponseEDNS(response *dns.Msg, clientDO bool) {
 	// Preserve the upstream OPT but normalize the fields resolved keys off of.
 	opt.SetDo(clientDO)
 	opt.SetUDPSize(dnsUDPBufSize)
+}
+
+// stripDNSSECRecords removes DNSSEC meta-records (RRSIG, NSEC, NSEC3, DNSKEY, DS) from every
+// section of the response in place, for delivery to a client that did not set the DO bit
+// (RFC 6840 §5.9). The OPT pseudo-record in Extra is left alone — ensureResponseEDNS owns the
+// OPT. Order within each section is otherwise preserved.
+func stripDNSSECRecords(msg *dns.Msg) {
+	msg.Answer = filterDNSSEC(msg.Answer)
+	msg.Ns = filterDNSSEC(msg.Ns)
+	msg.Extra = filterDNSSEC(msg.Extra)
+}
+
+// filterDNSSEC returns rrs with DNSSEC meta-records removed, reusing the backing array. OPT is
+// not a DNSSEC record and is kept (the DO bit, not the OPT's presence, signals DNSSEC intent).
+func filterDNSSEC(rrs []dns.RR) []dns.RR {
+	if len(rrs) == 0 {
+		return rrs
+	}
+	kept := rrs[:0]
+	for _, rr := range rrs {
+		switch rr.Header().Rrtype {
+		case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeDNSKEY, dns.TypeDS:
+			// drop the signature record
+		default:
+			kept = append(kept, rr)
+		}
+	}
+	return kept
 }
 
 // applyDNSSEC runs the validator over an upstream response and applies the three-way DNSSEC
@@ -331,7 +384,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 	// never forwarded upstream. See formErrResponse for why.
 	if len(query.Question) != 1 {
 		response := formErrResponse(query)
-		ensureResponseEDNS(response, clientDNSSECOK(query))
+		ensureResponseEDNS(response, query)
 		respBuf, err := response.Pack()
 		if err != nil {
 			s.logger.Printf("pack FORMERR response error: %v", err)
@@ -366,7 +419,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 			}
 			// Echo EDNS0 so a DNSSEC-probing stub resolver sees an EDNS-capable
 			// server and does not downgrade (Issue 28).
-			ensureResponseEDNS(response, clientDNSSECOK(query))
+			ensureResponseEDNS(response, query)
 			respBuf, err := response.Pack()
 			if err != nil {
 				s.logger.Printf("pack NXDOMAIN response error: %v", err)
@@ -396,7 +449,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 			cached.Id = query.Id
 			// Normalize EDNS0 to this client's DO request (the cache key already
 			// separates DO/non-DO entries, but re-assert OPT+bufsize for Issue 28).
-			ensureResponseEDNS(cached, clientDNSSECOK(query))
+			ensureResponseEDNS(cached, query)
 			// Encode and send cached response
 			respBuf, err := cached.Pack()
 			if err != nil {
@@ -455,7 +508,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 	// Normalize EDNS0 on the outgoing reply (OPT present, DO matches the client's
 	// request, standard bufsize) so a validating stub resolver does not downgrade
 	// its feature set and stall (Issue 28).
-	ensureResponseEDNS(response, clientDNSSECOK(query))
+	ensureResponseEDNS(response, query)
 
 	// Encode response
 	respBuf, err := response.Pack()
@@ -657,7 +710,7 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 		// Normalize EDNS0 on the outgoing reply (covers blocklist NXDOMAIN, cache
 		// hit, and upstream reply) so a validating stub resolver does not downgrade
 		// and stall (Issue 28).
-		ensureResponseEDNS(response, clientDNSSECOK(query))
+		ensureResponseEDNS(response, query)
 
 		// Encode and send response with length prefix
 		respBuf, err := response.Pack()
