@@ -32,6 +32,7 @@ import (
 	"github.com/rcvd-dns/rcvd/internal/cache"
 	"github.com/rcvd-dns/rcvd/internal/config"
 	"github.com/rcvd-dns/rcvd/internal/dnssec"
+	applog "github.com/rcvd-dns/rcvd/internal/logger"
 	rcvd_tls "github.com/rcvd-dns/rcvd/internal/rcvd_tls"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
@@ -76,12 +77,34 @@ func stripOPT(msg *dns.Msg) {
 	msg.Extra = kept
 }
 
-// ensureResponseEDNS guarantees the reply carries a well-formed EDNS0 OPT with its DO
-// bit matching the client's request and a standard bufsize — so a validating client
-// (e.g. a stub resolver over the encrypted leg) sees an EDNS/DNSSEC-capable server and
-// does not downgrade its feature set (Issue 28). Mirrors the Mode-1 helper of the same name.
-func ensureResponseEDNS(response *dns.Msg, clientDO bool) {
+// ensureResponseEDNS normalizes the reply's EDNS0 OPT against the client's query per
+// RFC 6891 §6.1.1: a requestor that included an OPT gets a well-formed OPT back (DO bit
+// matching the request, standard bufsize) so a validating client does not downgrade its
+// feature set (Issue 28); a requestor that sent NO OPT (a non-EDNS query) gets a NON-EDNS
+// response, i.e. no OPT at all. rcvd previously always appended an OPT even to a non-EDNS
+// query — strict mobile native-DoH stacks (iOS 18 DNSecure, modern Android) break on that
+// unsolicited OPT and refuse the resolver (Issue 36); Google/Quad9/AdGuard omit it and work.
+// Mirrors the Mode-1 helper of the same name.
+func ensureResponseEDNS(response, query *dns.Msg) {
 	if response == nil {
+		return
+	}
+	queryOPT := query.IsEdns0()
+	clientDO := queryOPT != nil && queryOPT.Do()
+	// A client that did not set DO must not receive DNSSEC records (RFC 6840 §5.9). We
+	// always query upstream with DO=1 (queryWithDO) so the validator has RRSIGs, so a reply
+	// for a signed zone carries RRSIG/NSEC/NSEC3 the client never asked for. Clearing the OPT
+	// DO bit below is not enough on its own — the records must go too, or a strict client
+	// (Firefox in DoH-only mode, macOS mDNSResponder) rejects or stalls on the response. This
+	// mirrors the Mode-1 fix (Issue 34); the Mode-2 path was missed when that fix first landed.
+	if !clientDO {
+		stripDNSSECRecords(response)
+	}
+	// Non-EDNS query → non-EDNS response: strip any OPT the upstream/validator left behind and
+	// do not add one (RFC 6891 §6.1.1; Issue 36). We always dial upstream with DO=1, so the
+	// response can carry an OPT the client never asked for — remove it here.
+	if queryOPT == nil {
+		stripOPT(response)
 		return
 	}
 	if opt := response.IsEdns0(); opt != nil {
@@ -92,30 +115,61 @@ func ensureResponseEDNS(response *dns.Msg, clientDO bool) {
 	response.SetEdns0(ednsUDPBufSize, clientDO)
 }
 
+// stripDNSSECRecords removes DNSSEC meta-records (RRSIG, NSEC, NSEC3, DNSKEY, DS) from
+// every section of the response in place, for a client that did not set the DO bit
+// (RFC 6840 §5.9). The OPT pseudo-record is left alone — ensureResponseEDNS owns it. The
+// AD bit is preserved: validation already happened, only the signature records are dropped.
+func stripDNSSECRecords(msg *dns.Msg) {
+	msg.Answer = filterDNSSEC(msg.Answer)
+	msg.Ns = filterDNSSEC(msg.Ns)
+	msg.Extra = filterDNSSEC(msg.Extra)
+}
+
+// filterDNSSEC returns rrs with DNSSEC meta-records removed, reusing the backing array.
+// OPT is not a DNSSEC record and is kept (the DO bit, not the OPT's presence, signals intent).
+func filterDNSSEC(rrs []dns.RR) []dns.RR {
+	if len(rrs) == 0 {
+		return rrs
+	}
+	kept := rrs[:0]
+	for _, rr := range rrs {
+		switch rr.Header().Rrtype {
+		case dns.TypeRRSIG, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeDNSKEY, dns.TypeDS:
+			// drop the signature record
+		default:
+			kept = append(kept, rr)
+		}
+	}
+	return kept
+}
+
 // Service exposes encrypted DNS endpoints (DoH, DoT, DoQ) for other tools.
-// Mode 2: RCVD acts as an upstream DNS service (not a resolver listening for clients).
+// Mode 2: rcvd acts as an upstream DNS service (not a resolver listening for clients).
 //
 // ValidateFunc applies the FULL DNSSEC outcome to a response in place and reports only whether the
 // response is BOGUS. It owns the three-way decision (RFC 4035 §4.3) so every listener stays simple
 // and identical:
 //   - SECURE   → sets the AD bit, counts validated, returns nil.
-//   - INSECURE → clears the AD bit, counts unsigned, returns nil (serve it; it is NOT a failure —
+//   - INSECURE → clears the AD bit, counts unsigned, returns nil (serve it; it is not a failure —
 //     e.g. a CNAME chain whose signed head validates but whose tail is unsigned, Issue 30).
 //   - BOGUS    → returns a non-nil error; the listener replaces the response with SERVFAIL.
 //
-// Returning nil therefore means "serve this response as adjusted" (secure OR insecure); an error
-// means "fail closed". Listeners MUST NOT set the AD bit themselves — the callback already has.
+// Returning nil therefore means "serve this response as adjusted" (secure or insecure); an error
+// means "fail closed". Listeners must not set the AD bit themselves — the callback already has.
 type ValidateFunc func(msg *dns.Msg) error
 
 type Service struct {
-	cfg        *config.UpstreamConfig
-	resolv     resolver.Resolver // Resolver to use for queries (typically fallback resolver)
-	cache      *cache.Cache      // SHARED with Mode 1 — one cache for the whole instance (may be nil)
-	validator  *dnssec.Validator // optional DNSSEC validator
-	stats      *statistics.Stats // optional runtime statistics
-	tlsConfig  *tls.Config
-	tlsManager *rcvd_tls.Manager // certmagic automation manager (if enabled)
-	logger     *log.Logger
+	cfg           *config.UpstreamConfig
+	advertiseHost string            // cert hostname advertised in DDR (RFC 9462); "" disables DDR
+	resolv        resolver.Resolver // Resolver to use for queries (typically fallback resolver)
+	cache         *cache.Cache      // SHARED with Mode 1 — one cache for the whole instance (may be nil)
+	validator     *dnssec.Validator // optional DNSSEC validator
+	stats         *statistics.Stats // optional runtime statistics
+	tlsConfig     *tls.Config
+	tlsManager    *rcvd_tls.Manager // certmagic automation manager (if enabled)
+	logger        *log.Logger
+	debugLog      *applog.Logger // optional leveled logger, forwarded to the DoQ listener so its
+	// benign-idle server-side lines log at debug (see DOQListener.SetDebugLogger). nil = prior behavior.
 
 	// Active listeners
 	dohListener *dohListener
@@ -142,6 +196,14 @@ func New(upstreamCfg *config.UpstreamConfig, fullConfig *config.Config, resolv r
 		validator: validator,
 		stats:     stats,
 		logger:    logger,
+	}
+
+	// DDR (RFC 9462) self-advertisement identity: the cert subject rcvd serves DoH under.
+	// This is the hostname clients must reach rcvd's DoH endpoint by, so it's the one we
+	// advertise in the SVCB Target for _dns.resolver.arpa. Same idiom as cmd/rcvd/main.go.
+	// Left empty when no automated cert domain is configured — DDR then stays off.
+	if len(fullConfig.TLSAutomation.AllowedDomains) > 0 {
+		s.advertiseHost = fullConfig.TLSAutomation.AllowedDomains[0]
 	}
 
 	// Load or generate TLS certificate
@@ -222,6 +284,11 @@ func (s *Service) setupTLS(fullConfig *config.Config) (*tls.Config, *rcvd_tls.Ma
 	}, nil, nil
 }
 
+// SetDebugLogger wires an optional leveled logger, forwarded to the DoQ listener at Start so its
+// benign-idle server-side lines log at debug rather than unconditionally. Must be called before
+// Start (the listener is created there). nil / unset keeps the prior always-on behavior.
+func (s *Service) SetDebugLogger(l *applog.Logger) { s.debugLog = l }
+
 // Start begins listening on configured endpoints.
 func (s *Service) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -235,7 +302,7 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 
 	// Build validate callback from DNSSEC validator (nil-safe). The callback applies the full
-	// three-way DNSSEC outcome (AD bit + stats) in place and returns an error ONLY for bogus — see
+	// three-way DNSSEC outcome (AD bit + stats) in place and returns an error only for bogus — see
 	// ValidateFunc. Centralizing it here keeps the DoQ/DoT/DoH listeners identical and prevents an
 	// insecure answer (Issue 30) from being mistaken for a validation failure and turned into SERVFAIL.
 	var validateFunc ValidateFunc
@@ -263,6 +330,40 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
+	// Build the DDR (RFC 9462) zone ONCE, then share it with every listener. It enumerates
+	// each encrypted transport rcvd actually serves, priority-ordered (RFC 9462 §3), so a
+	// client discovering over any one transport learns about all of them. Every listener
+	// also serves the resolver.arpa zone itself — see ddr.go for the §6.4 containment rule.
+	ddr := newDDRZone(s.advertiseHost, s.cfg.ListenDoH, s.cfg.ListenDoT, s.cfg.ListenDoQ,
+		s.cfg.DoH3, s.cfg.AdvertiseIPs)
+
+	switch {
+	case ddr.advertises():
+		for _, d := range ddr.designations {
+			s.logger.Printf("DDR (RFC 9462) designation: _dns.resolver.arpa SVCB %d %s port=%d alpn=%v",
+				d.priority, s.advertiseHost, d.port, d.alpn)
+		}
+		s.logger.Printf("DDR hints: ipv4hint=%v ipv6hint=%v", ddr.v4, ddr.v6)
+
+		// A hintless advert is spec-legal but Android's native resolver rejects it outright and
+		// falls back to DoT on :853 — silently, from the client side, so the operator sees a
+		// working DoH endpoint that phones simply never use. Warn loudly rather than fail: DDR
+		// is still useful to spec-conformant clients, and plenty of deployments have no mobile
+		// clients at all. Set advertise_ips to the public address(es) to close this.
+		if len(ddr.v4) == 0 && len(ddr.v6) == 0 {
+			s.logger.Printf("DDR warning: no ipv4hint/ipv6hint in the advert (the listen address is a " +
+				"wildcard or non-IP bind and advertise_ips is unset) — Android native Private DNS requires " +
+				"the hints and will ignore this record, falling back to DoT; set " +
+				"upstream_service.advertise_ips to the public address(es) clients dial")
+		}
+	default:
+		// No cert hostname means no conformant way to name an endpoint, so rcvd designates
+		// nothing. It still serves resolver.arpa: RFC 9462 §4 wants an explicit NODATA rather
+		// than a forwarded query, so clients get an accurate "no designation" signal.
+		s.logger.Printf("DDR (RFC 9462): no designations advertised (no tls_automation domain " +
+			"configured); serving resolver.arpa as a locally served zone (NODATA)")
+	}
+
 	// Start DoH listener if configured. When cfg.DoH3 is set, the same listener
 	// ALSO serves DoH3 (HTTP/3 over QUIC/UDP) on the same address, alongside the
 	// always-on HTTP/2-over-TCP DoH.
@@ -271,6 +372,7 @@ func (s *Service) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("start DoH listener: %w", err)
 		}
+		dohList.ddr = ddr
 		s.dohListener = dohList
 		s.wg.Add(1)
 		go func() {
@@ -290,6 +392,7 @@ func (s *Service) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("start DoT listener: %w", err)
 		}
+		dotList.ddr = ddr
 		s.dotListener = dotList
 		s.wg.Add(1)
 		go func() {
@@ -304,6 +407,12 @@ func (s *Service) Start(ctx context.Context) error {
 		doqList, err := newDOQListener(s.cfg.ListenDoQ, s.tlsConfig, s.resolv, s.cache, validateFunc, s.stats, s.logger)
 		if err != nil {
 			return fmt.Errorf("start DoQ listener: %w", err)
+		}
+		doqList.ddr = ddr
+		// Forward the leveled logger (if wired) so the DoQ listener's benign-idle server-side
+		// lines (client-closed write, idle accept close) log at debug instead of flooding.
+		if s.debugLog != nil {
+			doqList.SetDebugLogger(s.debugLog)
 		}
 		s.doqListener = doqList
 		s.wg.Add(1)
@@ -450,7 +559,7 @@ func autogenSANHosts(cfg *config.UpstreamConfig) []string {
 		}
 	}
 	// Operator-configured extra SAN entries (tunnel/LAN hostnames, extra IPs) that aren't the
-	// bind address — e.g. a client connecting via doh-dev.rcvd.net to a 0.0.0.0 bind.
+	// bind address — e.g. a client reaching a public hostname that fronts a wildcard bind.
 	for _, h := range cfg.TLSCertHosts {
 		add(h)
 	}

@@ -33,6 +33,8 @@ type DOTListener struct {
 	listener     net.Listener
 	done         chan struct{}
 	closeOnce    sync.Once // guards Close (idempotent without racing Serve's field reads)
+
+	ddr ddrZone // RFC 9462 resolver.arpa zone: designations + §6.4 containment
 }
 
 // NewDOTListener creates a new DoT listener.
@@ -48,12 +50,27 @@ func NewDOTListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 		return nil, fmt.Errorf("listen TCP: %w", err)
 	}
 
+	// Pin the DoT ALPN token on a clone of the shared config. The base config handed to
+	// every Mode-2 listener advertises NextProtos = ["h2"] (see internal/rcvd_tls), so a
+	// client that offers the "dot" token — which Android Private DNS, kdig, and openssl all
+	// do — finds no common protocol and the handshake fails with no_application_protocol.
+	// The DoH and DoQ listeners each clone-and-pin their own token ("h2", "doq"); DoT is the
+	// leg that was missing that clause. RFC 7858 registers only port 853, not an ALPN token
+	// (the "dot" identifier is the IANA TLS-ALPN registration reused by RFC 9461 for DDR), so
+	// accepting "dot" is the interoperable behavior. Go still admits a client that offers no
+	// ALPN at all, so lenient callers keep working.
+	dotTLSConfig := tlsConfig
+	if dotTLSConfig != nil {
+		dotTLSConfig = tlsConfig.Clone()
+		dotTLSConfig.NextProtos = []string{alpnDoT}
+	}
+
 	// Wrap with TLS
-	tlsListener := tls.NewListener(tcpListener, tlsConfig)
+	tlsListener := tls.NewListener(tcpListener, dotTLSConfig)
 
 	return &DOTListener{
 		addr:         addr,
-		tlsConfig:    tlsConfig,
+		tlsConfig:    dotTLSConfig,
 		resolv:       resolv,
 		cache:        dnsCache,
 		validateFunc: validateFunc,
@@ -217,6 +234,11 @@ func (d *DOTListener) handleConnection(conn net.Conn, ctx context.Context) {
 				},
 				Question: query.Question,
 			}
+		} else {
+			// DDR (RFC 9462): resolver.arpa is served locally in its entirety — the SVCB
+			// probe gets rcvd's designations, everything else in the zone gets NODATA. nil
+			// means the query is not for that zone and falls through to normal resolution.
+			response = d.ddr.answer(query)
 		}
 
 		// SHARED CACHE check (same object as Mode 1).
@@ -285,7 +307,7 @@ func (d *DOTListener) handleConnection(conn net.Conn, ctx context.Context) {
 		}
 
 		// Normalize EDNS0 so a validating client does not downgrade (Issue 28).
-		ensureResponseEDNS(response, clientDNSSECOK(query))
+		ensureResponseEDNS(response, query)
 
 		// Encode response
 		respBuf, err := response.Pack()

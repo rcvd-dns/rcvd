@@ -17,6 +17,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/rcvd-dns/rcvd/internal/cache"
+	applog "github.com/rcvd-dns/rcvd/internal/logger"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
 )
@@ -32,9 +33,15 @@ type DOQListener struct {
 	validateFunc ValidateFunc      // optional DNSSEC validation callback
 	stats        *statistics.Stats // optional runtime statistics
 	logger       *log.Logger
-	listener     *quic.Listener
-	udpConn      net.PacketConn
-	closeOnce    sync.Once // guards Close (idempotent without racing Serve's field reads)
+	debugLog     *applog.Logger // optional leveled logger; when set, benign-idle server-side
+	// events (a client that closed its connection mid-response, or an idle connection timing
+	// out of the accept loop) log at DEBUG instead of unconditionally on `logger`. nil = the
+	// prior behavior (those lines stay on `logger`). Mirrors the client resolver's SetLogger.
+	listener  *quic.Listener
+	udpConn   net.PacketConn
+	closeOnce sync.Once // guards Close (idempotent without racing Serve's field reads)
+
+	ddr ddrZone // RFC 9462 resolver.arpa zone: designations + §6.4 containment
 }
 
 // NewDOQListener creates a new DoQ listener.
@@ -85,6 +92,54 @@ func NewDOQListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 		listener:     quicListener,
 		udpConn:      udpConn,
 	}, nil
+}
+
+// SetDebugLogger wires an optional leveled logger. When set, benign-idle server-side events
+// (a LAN client that closed its DoQ connection just as we went to write the response, or a
+// pooled connection idling out of the accept loop) are logged at DEBUG rather than emitted
+// unconditionally on the plain logger. These are the server-side shadow of the client's own
+// idle-gap re-dial (see resolver/doq.go logIdleRetry): the client recycles a stale connection
+// and re-asks on a fresh one, so the write-reset / idle-close here is expected and recovered,
+// never lost data. nil (the default) keeps the prior always-on behavior for those lines.
+func (d *DOQListener) SetDebugLogger(l *applog.Logger) { d.debugLog = l }
+
+// logBenignIdle emits a server-side benign-idle line at debug when a leveled logger is wired;
+// otherwise falls back to the plain logger so nothing is silently dropped when no debug logger
+// is set (tests, other callers). Genuine (non-idle) errors never route here — callers classify
+// with isBenignIdleConnErr first and keep unexpected errors on the plain logger.
+func (d *DOQListener) logBenignIdle(format string, args ...any) {
+	if d.debugLog != nil {
+		d.debugLog.Debugf(format, args...)
+		return
+	}
+	d.logger.Printf(format, args...)
+}
+
+// isBenignIdleConnErr reports whether err is the expected "the client's QUIC connection went
+// away" condition — a clean application close (QUIC error code 0x0 / NO_ERROR, local or remote),
+// a quic-go idle timeout, or a closed connection. These occur constantly on a bursty/roaming
+// leg as clients recycle stale pooled connections (RFC 9250 §5.5.1 reuse + idle close), and are
+// recovered by the client's re-ask on a fresh connection — not a fault to surface at info level.
+func isBenignIdleConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check ApplicationError FIRST and classify strictly by code. quic-go's *ApplicationError
+	// reports errors.Is(err, net.ErrClosed) == true for ANY code (it is, after all, a closed
+	// connection), so the net.ErrClosed check below would otherwise swallow a genuine non-zero
+	// application close (e.g. PROTOCOL_ERROR) as "benign". A clean close carries code 0x0
+	// (NO_ERROR / RFC 9250 §4.3 DOQ_NO_ERROR) — only that is benign; any other code is not.
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) {
+		return appErr.ErrorCode == 0
+	}
+	// Non-application errors: an idle timeout or a plain closed connection is the expected
+	// "client went away" condition on a bursty/roaming leg.
+	var idleTimeout *quic.IdleTimeoutError
+	if errors.As(err, &idleTimeout) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return false
 }
 
 // Serve accepts and handles DoQ connections.
@@ -146,7 +201,14 @@ func (d *DOQListener) handleConnection(ctx context.Context, conn *quic.Conn) {
 			if isNonCriticalNetErr(err) {
 				continue
 			}
-			d.logger.Printf("DoQ accept stream error: %v", err)
+			// A terminal accept error that is just the client's idle/clean close (idle
+			// timeout, connection closed, NO_ERROR) is benign on a bursty/roaming leg —
+			// log it at debug. A genuinely unexpected accept error still logs on `logger`.
+			if isBenignIdleConnErr(err) {
+				d.logBenignIdle("DoQ accept stream closed (idle/clean): %v", err)
+			} else {
+				d.logger.Printf("DoQ accept stream error: %v", err)
+			}
 			return
 		}
 
@@ -255,6 +317,11 @@ func (d *DOQListener) handleStream(ctx context.Context, stream *quic.Stream) {
 			},
 			Question: query.Question,
 		}
+	} else {
+		// DDR (RFC 9462): resolver.arpa is served locally in its entirety — the SVCB probe
+		// gets rcvd's designations, everything else in the zone gets NODATA. nil means the
+		// query is not for that zone and falls through to normal resolution below.
+		response = d.ddr.answer(query)
 	}
 
 	// SHARED CACHE check (same object as Mode 1) — serve a cached answer without an
@@ -325,7 +392,7 @@ func (d *DOQListener) handleStream(ctx context.Context, stream *quic.Stream) {
 	}
 
 	// Normalize EDNS0 so a validating client does not downgrade (Issue 28).
-	ensureResponseEDNS(response, clientDNSSECOK(query))
+	ensureResponseEDNS(response, query)
 
 	// Encode response
 	respBuf, err := response.Pack()
@@ -334,14 +401,26 @@ func (d *DOQListener) handleStream(ctx context.Context, stream *quic.Stream) {
 		return
 	}
 
-	// Write response with length prefix
+	// Write response with length prefix. A write failure here is almost always the client
+	// having already closed its QUIC connection (it recycled a stale pooled conn and re-asked
+	// on a fresh one — the client-side idle-gap re-dial): a clean NO_ERROR / connection-reset
+	// / idle close. That is benign and recovered, so it logs at debug; a genuinely unexpected
+	// write error still logs unconditionally.
 	respLen := []byte{byte(len(respBuf) >> 8), byte(len(respBuf))}
 	if _, err := stream.Write(respLen); err != nil {
-		d.logger.Printf("DoQ write length error: %v", err)
+		if isBenignIdleConnErr(err) {
+			d.logBenignIdle("DoQ write length: client connection closed (idle/clean): %v", err)
+		} else {
+			d.logger.Printf("DoQ write length error: %v", err)
+		}
 		return
 	}
 	if _, err := stream.Write(respBuf); err != nil {
-		d.logger.Printf("DoQ write message error: %v", err)
+		if isBenignIdleConnErr(err) {
+			d.logBenignIdle("DoQ write message: client connection closed (idle/clean): %v", err)
+		} else {
+			d.logger.Printf("DoQ write message error: %v", err)
+		}
 		return
 	}
 	// Single response-bucket accounting point, keyed on rcode (Issue 27).

@@ -53,6 +53,8 @@ type DOHListener struct {
 	h3server  *http3.Server // HTTP/3 over QUIC ("DoH3") — created only when enableH3
 	enableH3  bool          // whether to also serve DoH3 (HTTP/3 over QUIC/UDP)
 	closeOnce sync.Once     // guards Close (idempotent without racing Serve's field reads)
+
+	ddr ddrZone // RFC 9462 resolver.arpa zone: designations + §6.4 containment
 }
 
 // NewDOHListener creates a new DoH listener.
@@ -259,8 +261,16 @@ func (d *DOHListener) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 			},
 			Question: query.Question,
 		}
-		ensureResponseEDNS(response, clientDNSSECOK(query))
+		ensureResponseEDNS(response, query)
 		d.writeResponse(w, response, servedStart)
+		return
+	}
+
+	// DDR (RFC 9462): resolver.arpa is served locally in its entirety — the SVCB probe gets
+	// rcvd's designations, everything else in the zone gets NODATA. Never forwarded upstream
+	// (§6.4) and never cached, since the answer describes this instance.
+	if resp := d.ddr.answer(query); resp != nil {
+		d.writeResponse(w, resp, servedStart)
 		return
 	}
 
@@ -274,7 +284,7 @@ func (d *DOHListener) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 				atomic.AddInt64(&d.stats.CacheHits, 1)
 			}
 			// Normalize EDNS0 to the client's DO request (Issue 28).
-			ensureResponseEDNS(cached, clientDNSSECOK(query))
+			ensureResponseEDNS(cached, query)
 			d.writeResponse(w, cached, servedStart)
 			return
 		}
@@ -334,7 +344,7 @@ func (d *DOHListener) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Normalize EDNS0 so a validating client does not downgrade (Issue 28).
-	ensureResponseEDNS(response, clientDNSSECOK(query))
+	ensureResponseEDNS(response, query)
 	d.writeResponse(w, response, servedStart)
 }
 
