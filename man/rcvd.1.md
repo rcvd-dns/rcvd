@@ -54,7 +54,9 @@ Connect to the running instance's Unix socket and print the live posture report:
 
 **-blocklist-reload**
 
-Connect to the running instance's Unix socket and trigger a hot-reload of the blocklist **files** (from **[blocklists] files**), then exit. Requires **stats_enabled = true**. The reload rebuilds the entire in-memory set from the files on disk and atomically swaps it in, so both **added and removed** domains take effect without restarting the process — preserving statistics, cache, and connections. It is asynchronous and non-blocking: the command returns immediately with an acknowledgment while the (potentially minute-long) rescan runs in the background, exactly like the startup load, so DNS is never paused. Final counts are written to the daemon log when the swap completes. Edit the file(s), then run this. Only local **files** are reloaded; **update_urls** are not re-fetched.
+Connect to the running instance's Unix socket and trigger a hot-reload of the blocklist **files** the running process already knows about — that is, the set of **[blocklists] files** it read when it started — then exit. Requires **stats_enabled = true** — the Unix control socket this connects to is created by the statistics feature, so with statistics off there is no socket to reach and the command cannot signal the daemon (the blocklist itself still filters normally; only this live-reload verb is unavailable). The reload re-reads those same files from disk, rebuilds the entire in-memory set, and atomically swaps it in, so both **added and removed** domains *within the known files* take effect without restarting the process — preserving statistics, cache, and connections. It is asynchronous and non-blocking: the command returns immediately with an acknowledgment while the (potentially minute-long) rescan runs in the background, exactly like the startup load, so DNS is never paused. Final counts are written to the daemon log when the swap completes. Edit the file(s), then run this. Only local **files** are reloaded; **update_urls** are not re-fetched.
+
+Note: this reloads the *contents* of the already-known files only. It does **not** re-read the config, so **adding a new path to [blocklists] files (or removing one) is NOT picked up by a hot-reload** — the running process keeps the file set it started with. Changing the set of blocklist files requires restarting the process so it re-reads the config.
 
 **-verify-upstream**
 
@@ -72,11 +74,11 @@ Probe the upstream at the given **0-based index** into the **[[upstreams]]** lis
 
 **-verify-self**
 
-Probe THIS instance's own Mode-2 listeners (DoH/DoT/DoQ) with a real TLS handshake and print the certificate presented to clients: subject, issuer, SANs, validity window, key type, fingerprint, and the leaf **SPKI pin** (**sha256//BASE64**). The pin is the same value a client configures as **pinned_pubkey** and validates with **-verify-pin**, so an operator managing both ends can copy it directly from this output. Classifies the cert source as SELF-SIGNED (tls_cert_autogen) or CA-ISSUED (certmagic/ACME or bring-your-own). Requires the instance to be running with Mode 2 enabled. If Mode 2 is disabled, reports that there is nothing to verify.
+Probe THIS instance's own Mode-2 listeners (DoH/DoT/DoQ) with a real TLS handshake and print the certificate presented to clients: subject, issuer, SANs, validity window, key type, fingerprint, and the leaf **SPKI pin** (**sha256//BASE64**). The pin is the same value a client configures as **pinned_pubkey** and validates with **-verify-pin**, so an operator managing both ends can copy it directly from this output. Classifies the cert source as SELF-SIGNED (tls_cert_autogen) or CA-ISSUED (certmagic/ACME or bring-your-own). When **tls_automation** is configured, the report header shows the DoH hostname (the first **allowed_domains** entry), which is also used as the default DoH SNI (see **-server-name**). Requires the instance to be running with Mode 2 enabled. If Mode 2 is disabled, reports that there is nothing to verify.
 
 **-server-name** *name*
 
-TLS SNI hostname to use when probing with **-verify-self**. Defaults to the hostname derived from each listener's configured address. Pass the real public DoH hostname when the instance uses certmagic on-demand TLS, so the cert is materialized for inspection.
+TLS SNI hostname to use when probing with **-verify-self**. For the DoH listener, defaults to the configured DoH hostname (**tls_automation** **allowed_domains**) when set, otherwise the hostname derived from the listener's address; DoT/DoQ use the listener-derived hostname. Pass this flag to override — e.g. to force a specific SNI when the instance serves multiple names.
 
 **-version**
 
@@ -200,6 +202,57 @@ validated by exact key match rather than CA chain, enabling a self-signed encryp
 With **tls_cert_autogen**, **tls_cert_hosts** adds extra hostnames or IPs to the self-signed
 certificate's SAN (e.g. a tunnel or LAN name that clients connect by) on top of the auto-derived
 listen-address hosts and loopback.
+
+**advertise_ips** lists the public IP addresses clients reach this instance at, published as the
+**ipv4hint**/**ipv6hint** of every DDR (RFC 9462) SVCB record rcvd serves for
+**_dns.resolver.arpa**. One setting covers all listeners, since each designation names the same
+host. When a listener binds a concrete IP literal, that address is used automatically and this
+setting is redundant. Set it whenever a listener binds a wildcard address (**0.0.0.0** or **::**)
+or sits behind NAT, because rcvd cannot then determine the address clients actually dial.
+
+Setting it matters for mobile discovery: Android's native resolver requires the hints. It reads
+the SVCB record and connects to the first hint address directly, never resolving the record's
+target name, so a record without hints is discarded and the system falls back to DoT on port 853.
+rcvd logs a warning at startup when it advertises DDR without hints. Values must be IPv4 or IPv6
+literals — a hostname is rejected at startup — and both families should be listed on a dual-stack
+endpoint.
+
+## DISCOVERY OF DESIGNATED RESOLVERS (DDR)
+
+When the upstream service runs with a certificate hostname configured, rcvd answers the RFC 9462
+discovery probe — an SVCB query for **_dns.resolver.arpa** — about itself, on every listener. It
+advertises one SVCB record per encrypted transport it is actually serving, ordered by the SVCB
+priority field: DoH first (priority 1), then DoT (2), then DoQ (3). DoH leads because it is the
+transport discovering clients act on and its port 443 survives networks that block port 853.
+
+The records are synthesized, never fetched. **_dns.resolver.arpa** is a special-use name that
+cannot be delegated in the global DNS, so a resolver answering for itself is the only conformant
+implementation — there is nothing to publish in a zone file.
+
+rcvd serves **resolver.arpa** as a locally served zone (RFC 9462 section 6.4, RFC 6303). Every
+other name and record type under it is answered with NODATA and a SOA for negative caching, and
+none of them are forwarded upstream. A resolver with no certificate hostname advertises nothing
+but still answers the zone, giving clients an explicit "no designated resolver" signal rather than
+a query that leaks to a third party.
+
+Choosing among the three TLS options:
+
+**tls_automation** is the option for any endpoint reached directly by a browser or by a native
+mobile DNS client. Browsers refuse a self-signed DoH resolver and fall back silently — the
+"add a security exception" flow does not apply to the DoH/TRR path — and native mobile clients
+(iOS DNSecure, Android Private DNS) have no exception mechanism at all. Both require a real
+domain name and a CA-trusted certificate for that name.
+
+**tls_cert**/**tls_key** is the option for a pinned deployment. The certificate may be
+self-signed: a client using **pinned_pubkey** authenticates the SPKI, not a CA chain. What
+matters is that the key is stable on disk, so the pin keeps matching across restarts.
+
+**tls_cert_autogen** generates a new key pair at every start. It suits development and testing
+(**curl -k**, container suites) and deployments behind a TLS-terminating proxy that presents a
+real certificate to clients. Because the key moves, the served SPKI changes on every restart:
+**tls_cert_autogen is incompatible with SPKI pinning**, and rcvd refuses to start when it can
+detect the combination (Mode 2 autogen while an upstream sets **pinned_pubkey**). Prefer
+**tls_cert**/**tls_key** whenever any client pins this instance.
 
 **[tls_automation]** — certmagic/ACME settings (when **tls_automation = true**). **challenge**
 is **http** (default) or **dns01** (no inbound port; for tunnels/CGNAT). For **dns01**, set a

@@ -63,7 +63,10 @@ Connect to the running instance's Unix socket and print the live posture report:
 \fB-blocklist-reload\fP
 
 .PP
-Connect to the running instance's Unix socket and trigger a hot-reload of the blocklist \fBfiles\fP (from \fB[blocklists] files\fP), then exit. Requires \fBstats_enabled = true\fP\&. The reload rebuilds the entire in-memory set from the files on disk and atomically swaps it in, so both \fBadded and removed\fP domains take effect without restarting the process — preserving statistics, cache, and connections. It is asynchronous and non-blocking: the command returns immediately with an acknowledgment while the (potentially minute-long) rescan runs in the background, exactly like the startup load, so DNS is never paused. Final counts are written to the daemon log when the swap completes. Edit the file(s), then run this. Only local \fBfiles\fP are reloaded; \fBupdate_urls\fP are not re-fetched.
+Connect to the running instance's Unix socket and trigger a hot-reload of the blocklist \fBfiles\fP the running process already knows about — that is, the set of \fB[blocklists] files\fP it read when it started — then exit. Requires \fBstats_enabled = true\fP — the Unix control socket this connects to is created by the statistics feature, so with statistics off there is no socket to reach and the command cannot signal the daemon (the blocklist itself still filters normally; only this live-reload verb is unavailable). The reload re-reads those same files from disk, rebuilds the entire in-memory set, and atomically swaps it in, so both \fBadded and removed\fP domains \fIwithin the known files\fP take effect without restarting the process — preserving statistics, cache, and connections. It is asynchronous and non-blocking: the command returns immediately with an acknowledgment while the (potentially minute-long) rescan runs in the background, exactly like the startup load, so DNS is never paused. Final counts are written to the daemon log when the swap completes. Edit the file(s), then run this. Only local \fBfiles\fP are reloaded; \fBupdate_urls\fP are not re-fetched.
+
+.PP
+Note: this reloads the \fIcontents\fP of the already-known files only. It does \fBnot\fP re-read the config, so \fBadding a new path to [blocklists] files (or removing one) is NOT picked up by a hot-reload\fP — the running process keeps the file set it started with. Changing the set of blocklist files requires restarting the process so it re-reads the config.
 
 .PP
 \fB-verify-upstream\fP
@@ -90,13 +93,13 @@ Probe the upstream at the given \fB0-based index\fP into the \fB[[upstreams]]\fP
 \fB-verify-self\fP
 
 .PP
-Probe THIS instance's own Mode-2 listeners (DoH/DoT/DoQ) with a real TLS handshake and print the certificate presented to clients: subject, issuer, SANs, validity window, key type, fingerprint, and the leaf \fBSPKI pin\fP (\fBsha256//BASE64\fP). The pin is the same value a client configures as \fBpinned_pubkey\fP and validates with \fB-verify-pin\fP, so an operator managing both ends can copy it directly from this output. Classifies the cert source as SELF-SIGNED (tls_cert_autogen) or CA-ISSUED (certmagic/ACME or bring-your-own). Requires the instance to be running with Mode 2 enabled. If Mode 2 is disabled, reports that there is nothing to verify.
+Probe THIS instance's own Mode-2 listeners (DoH/DoT/DoQ) with a real TLS handshake and print the certificate presented to clients: subject, issuer, SANs, validity window, key type, fingerprint, and the leaf \fBSPKI pin\fP (\fBsha256//BASE64\fP). The pin is the same value a client configures as \fBpinned_pubkey\fP and validates with \fB-verify-pin\fP, so an operator managing both ends can copy it directly from this output. Classifies the cert source as SELF-SIGNED (tls_cert_autogen) or CA-ISSUED (certmagic/ACME or bring-your-own). When \fBtls_automation\fP is configured, the report header shows the DoH hostname (the first \fBallowed_domains\fP entry), which is also used as the default DoH SNI (see \fB-server-name\fP). Requires the instance to be running with Mode 2 enabled. If Mode 2 is disabled, reports that there is nothing to verify.
 
 .PP
 \fB-server-name\fP \fIname\fP
 
 .PP
-TLS SNI hostname to use when probing with \fB-verify-self\fP\&. Defaults to the hostname derived from each listener's configured address. Pass the real public DoH hostname when the instance uses certmagic on-demand TLS, so the cert is materialized for inspection.
+TLS SNI hostname to use when probing with \fB-verify-self\fP\&. For the DoH listener, defaults to the configured DoH hostname (\fBtls_automation\fP \fBallowed_domains\fP) when set, otherwise the hostname derived from the listener's address; DoT/DoQ use the listener-derived hostname. Pass this flag to override — e.g. to force a specific SNI when the instance serves multiple names.
 
 .PP
 \fB-version\fP
@@ -267,6 +270,64 @@ validated by exact key match rather than CA chain, enabling a self-signed encryp
 With \fBtls_cert_autogen\fP, \fBtls_cert_hosts\fP adds extra hostnames or IPs to the self-signed
 certificate's SAN (e.g. a tunnel or LAN name that clients connect by) on top of the auto-derived
 listen-address hosts and loopback.
+
+.PP
+\fBadvertise_ips\fP lists the public IP addresses clients reach this instance at, published as the
+\fBipv4hint\fP/\fBipv6hint\fP of every DDR (RFC 9462) SVCB record rcvd serves for
+\fB_dns.resolver.arpa\fP\&. One setting covers all listeners, since each designation names the same
+host. When a listener binds a concrete IP literal, that address is used automatically and this
+setting is redundant. Set it whenever a listener binds a wildcard address (\fB0.0.0.0\fP or \fB::\fP)
+or sits behind NAT, because rcvd cannot then determine the address clients actually dial.
+
+.PP
+Setting it matters for mobile discovery: Android's native resolver requires the hints. It reads
+the SVCB record and connects to the first hint address directly, never resolving the record's
+target name, so a record without hints is discarded and the system falls back to DoT on port 853.
+rcvd logs a warning at startup when it advertises DDR without hints. Values must be IPv4 or IPv6
+literals — a hostname is rejected at startup — and both families should be listed on a dual-stack
+endpoint.
+
+.SH DISCOVERY OF DESIGNATED RESOLVERS (DDR)
+When the upstream service runs with a certificate hostname configured, rcvd answers the RFC 9462
+discovery probe — an SVCB query for \fB_dns.resolver.arpa\fP — about itself, on every listener. It
+advertises one SVCB record per encrypted transport it is actually serving, ordered by the SVCB
+priority field: DoH first (priority 1), then DoT (2), then DoQ (3). DoH leads because it is the
+transport discovering clients act on and its port 443 survives networks that block port 853.
+
+.PP
+The records are synthesized, never fetched. \fB_dns.resolver.arpa\fP is a special-use name that
+cannot be delegated in the global DNS, so a resolver answering for itself is the only conformant
+implementation — there is nothing to publish in a zone file.
+
+.PP
+rcvd serves \fBresolver.arpa\fP as a locally served zone (RFC 9462 section 6.4, RFC 6303). Every
+other name and record type under it is answered with NODATA and a SOA for negative caching, and
+none of them are forwarded upstream. A resolver with no certificate hostname advertises nothing
+but still answers the zone, giving clients an explicit "no designated resolver" signal rather than
+a query that leaks to a third party.
+
+.PP
+Choosing among the three TLS options:
+
+.PP
+\fBtls_automation\fP is the option for any endpoint reached directly by a browser or by a native
+mobile DNS client. Browsers refuse a self-signed DoH resolver and fall back silently — the
+"add a security exception" flow does not apply to the DoH/TRR path — and native mobile clients
+(iOS DNSecure, Android Private DNS) have no exception mechanism at all. Both require a real
+domain name and a CA-trusted certificate for that name.
+
+.PP
+\fBtls_cert\fP/\fBtls_key\fP is the option for a pinned deployment. The certificate may be
+self-signed: a client using \fBpinned_pubkey\fP authenticates the SPKI, not a CA chain. What
+matters is that the key is stable on disk, so the pin keeps matching across restarts.
+
+.PP
+\fBtls_cert_autogen\fP generates a new key pair at every start. It suits development and testing
+(\fBcurl -k\fP, container suites) and deployments behind a TLS-terminating proxy that presents a
+real certificate to clients. Because the key moves, the served SPKI changes on every restart:
+\fBtls_cert_autogen is incompatible with SPKI pinning\fP, and rcvd refuses to start when it can
+detect the combination (Mode 2 autogen while an upstream sets \fBpinned_pubkey\fP). Prefer
+\fBtls_cert\fP/\fBtls_key\fP whenever any client pins this instance.
 
 .PP
 \fB[tls_automation]\fP — certmagic/ACME settings (when \fBtls_automation = true\fP). \fBchallenge\fP
