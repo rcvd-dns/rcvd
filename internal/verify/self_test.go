@@ -108,7 +108,7 @@ func TestIssuerCommonName(t *testing.T) {
 
 func TestVerifySelf_Mode2Disabled(t *testing.T) {
 	cfg := &config.UpstreamConfig{Enabled: false}
-	out, ok := VerifySelf(nil, "/etc/rcvd/rcvd.toml", cfg, "")
+	out, ok := VerifySelf(nil, "/etc/rcvd/rcvd.toml", cfg, "", "")
 	if ok {
 		t.Error("VerifySelf should report not-ok when Mode 2 is disabled")
 	}
@@ -119,11 +119,24 @@ func TestVerifySelf_Mode2Disabled(t *testing.T) {
 
 func TestVerifySelf_NoListeners(t *testing.T) {
 	cfg := &config.UpstreamConfig{Enabled: true} // enabled but no listen_* set
-	out, ok := VerifySelf(nil, "/etc/rcvd/rcvd.toml", cfg, "")
+	out, ok := VerifySelf(nil, "/etc/rcvd/rcvd.toml", cfg, "", "")
 	if ok {
 		t.Error("VerifySelf should report not-ok when no listener is configured")
 	}
 	if !strings.Contains(out, "no listener address") {
 		t.Errorf("expected a 'no listener address' message, got: %q", out)
+	}
+}
+
+func TestFormatSelfResults_ShowsDoHHostname(t *testing.T) {
+	// The configured DoH hostname must appear in the header when present, and be
+	// absent (no empty "DoH hostname:" line) when not.
+	with := formatSelfResults("/etc/rcvd/rcvd-roam.toml", "doh-dev.rcvd.net", nil)
+	if !strings.Contains(with, "DoH hostname: doh-dev.rcvd.net") {
+		t.Errorf("expected the DoH hostname in the header, got:\n%s", with)
+	}
+	without := formatSelfResults("/etc/rcvd/rcvd.toml", "", nil)
+	if strings.Contains(without, "DoH hostname:") {
+		t.Errorf("expected no DoH-hostname line when unset, got:\n%s", without)
 	}
 }

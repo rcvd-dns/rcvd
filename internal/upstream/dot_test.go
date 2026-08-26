@@ -326,6 +326,74 @@ func TestDOTListenerClose(t *testing.T) {
 	}
 }
 
+// TestDOTListenerAcceptsDoTALPN is the Issue 38 regression: a client that offers the "dot"
+// ALPN token (as Android Private DNS, kdig, and openssl all do) must complete the TLS
+// handshake, and the listener must negotiate "dot". Before the fix the DoT listener inherited
+// the shared base config's NextProtos = ["h2"] and answered a "dot" client with a fatal
+// no_application_protocol alert. A client that offers no ALPN at all must still connect.
+func TestDOTListenerAcceptsDoTALPN(t *testing.T) {
+	certPEM, keyPEM, err := generateSelfSignedCert([]string{"localhost", "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("load keypair: %v", err)
+	}
+
+	// Reproduce the real defect: the base config carries the h2 ALPN, exactly as the shared
+	// Mode-2 config does. The listener must not let that leak through and reject "dot".
+	baseConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2"},
+	}
+
+	mockResolver := &MockResolver{
+		response: &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess}},
+	}
+	listener, err := NewDOTListener("127.0.0.1:0", baseConfig, mockResolver, nil, nil, nil, testLogger())
+	if err != nil {
+		t.Fatalf("create listener: %v", err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go listener.Serve(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	addr := listener.listener.Addr().String()
+
+	// 1. A client offering "dot" must handshake and see "dot" negotiated.
+	dotClient := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"dot"}}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, dotClient)
+	if err != nil {
+		t.Fatalf("handshake with dot ALPN failed (Issue 38 regression): %v", err)
+	}
+	if got := conn.ConnectionState().NegotiatedProtocol; got != "dot" {
+		t.Errorf("negotiated protocol = %q, want %q", got, "dot")
+	}
+	conn.Close()
+
+	// 2. A lenient client that offers no ALPN must still connect (base RFC 7858 does not
+	//    require ALPN, so this path must not regress).
+	noALPNClient := &tls.Config{InsecureSkipVerify: true}
+	conn2, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, noALPNClient)
+	if err != nil {
+		t.Fatalf("handshake with no ALPN failed: %v", err)
+	}
+	conn2.Close()
+
+	// 3. A client offering only "h2" (not a DoT client) must be rejected — the listener is a
+	//    DoT endpoint, not an HTTP/2 one.
+	h2Client := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}}
+	conn3, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, h2Client)
+	if err == nil {
+		conn3.Close()
+		t.Error("expected handshake to fail for an h2-only client on the DoT listener, got success")
+	}
+}
+
 // BenchmarkDOTListenerMessagePacking benchmarks message packing.
 func BenchmarkDOTListenerMessagePacking(b *testing.B) {
 	query := &dns.Msg{

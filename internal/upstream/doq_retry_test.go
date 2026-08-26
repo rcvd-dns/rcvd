@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/rcvd-dns/rcvd/internal/config"
+	"github.com/rcvd-dns/rcvd/internal/logger"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 )
 
@@ -54,9 +54,12 @@ func TestDoQClientRetriesStaleConnection(t *testing.T) {
 	l1, cancel1 := startServer()
 
 	// A logger we can inspect to confirm the retry PATH classification (Issue 31 3a).
+	// Debug level: the benign idle-gap retry line is debug-gated (it is a successful
+	// recovery counted in DoQIdleRetries; info stays quiet), so we opt into it here to
+	// keep the conditional log-classification assertions below meaningful.
 	var logBuf bytes.Buffer
 	client := resolver.NewDoQResolver("localhost", "127.0.0.1", 18855, pin, nil)
-	client.SetLogger(log.New(&logBuf, "", 0))
+	client.SetLogger(logger.New("debug", &logBuf))
 	defer client.Close()
 
 	ask := func(name string) (*dns.Msg, error) {

@@ -67,6 +67,64 @@ func TestDoQResponseMatchesQuery(t *testing.T) {
 	}
 }
 
+// TestDoQResponseUsable is the deterministic guard for the ISSUES 31 empty-answer-on-retry
+// break: a stale-conn DoQ retry can return a frame that parses and echoes the question but
+// carries no usable answer (truncated, or an empty NOERROR with no SOA). The field symptom was
+// an iOS DoH client (pointed at the rcvd-roam tunnel) getting NOERROR/ans=0 for github.com/A —
+// an address-less "success" that breaks page loads. These must be rejected (retryable), while a
+// legitimate NODATA (empty answer WITH an SOA) and a normal answer must pass.
+func TestDoQResponseUsable(t *testing.T) {
+	answer := func() *dns.Msg {
+		m := new(dns.Msg)
+		m.SetQuestion("github.com.", dns.TypeA)
+		m.Rcode = dns.RcodeSuccess
+		m.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: "github.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   []byte{140, 82, 121, 4},
+		}}
+		return m
+	}
+	nodata := func() *dns.Msg {
+		m := new(dns.Msg)
+		m.SetQuestion("github.com.", dns.TypeAAAA)
+		m.Rcode = dns.RcodeSuccess
+		m.Ns = []dns.RR{&dns.SOA{
+			Hdr: dns.RR_Header{Name: "github.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 900},
+			Ns:  "ns.github.com.", Mbox: "hostmaster.github.com.", Serial: 1,
+		}}
+		return m
+	}
+	emptyNoSOA := func() *dns.Msg {
+		m := new(dns.Msg)
+		m.SetQuestion("github.com.", dns.TypeA)
+		m.Rcode = dns.RcodeSuccess // NOERROR, zero answers, no SOA — the degraded frame
+		return m
+	}
+	truncated := func() *dns.Msg {
+		m := answer()
+		m.Truncated = true
+		return m
+	}
+
+	tests := []struct {
+		name string
+		resp *dns.Msg
+		want error
+	}{
+		{"normal answer passes", answer(), nil},
+		{"legitimate NODATA with SOA passes", nodata(), nil},
+		{"empty NOERROR without SOA is rejected (the field break)", emptyNoSOA(), errDoQEmptyNoSOA},
+		{"truncated response is rejected (RFC 9250 4.3)", truncated(), errDoQTruncated},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := doqResponseUsable(tc.resp); got != tc.want {
+				t.Errorf("doqResponseUsable = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDoQRecycleConnIdentity proves the ISSUES 31 shared-connection fix at the pool-pointer
 // level WITHOUT a live QUIC connection: recycleConn must only clear the pool when the bad
 // connection is still the pooled one. If a sibling has already replaced it, recycling the
