@@ -1,78 +1,33 @@
 #!/sbin/openrc-run
 
 name="rcvd"
-description="RCVD - Resilient, Cryptographic, Verifiable DNS"
-RCVD_CONF="/etc/rcvd/rcvd.toml"
+description="rcvd - Resilient, Cryptographic, Verifiable DNS"
+RCVD_CONF="${RCVD_CONF:-/etc/rcvd/rcvd.toml}"
 
-command="/usr/local/bin/rcvd"
-command_args="-config ${RCVD_CONF}"
-command_background=true
+command="/usr/bin/rcvd"
+command_args="${RCVD_OPTS:--config ${RCVD_CONF}}"
+command_user="${RCVD_USER:-rcvd}:${RCVD_GROUP:-rcvd}"
 pidfile="/run/${RC_SVCNAME}.pid"
-command_user="rcvd:rcvd"
-
-# Needed to bind privileged ports (<1024) as the unprivileged rcvd user — e.g. a
-# Mode-2 LAN-facing DoQ/DoT service on :853, or listening on :53 directly. OpenRC
-# applies this at start via start-stop-daemon, so it survives reboots AND binary
-# reinstalls (unlike a file-level `setcap`, which is stripped by `install`).
-# Comment this out if rcvd only uses unprivileged ports (e.g. :5300).
-capabilities="^cap_net_bind_service"
-
 required_files="${RCVD_CONF}"
 
+# Let the unprivileged rcvd user bind privileged ports (<1024) — e.g. a
+# Mode-2 LAN-facing DoQ/DoT service on :853, or a loopback :53 listener
+# (rcvd only ever binds :53 on 127.0.0.1/::1). Applied by supervise-daemon at
+# start, so it survives reboots and reinstalls (unlike a file setcap, which
+# install strips). Comment out if rcvd only uses unprivileged ports (e.g. :5300).
+capabilities="^cap_net_bind_service"
+
 depend() {
-    need net
-    after firewall
-    use logger dns
-}
-
-# Parse a value from the TOML config (simple key = "value" or key = value).
-_toml_get() {
-    grep -m1 "^[[:space:]]*${1}[[:space:]]*=" "${RCVD_CONF}" \
-        | sed 's/.*=[[:space:]]*//' | tr -d '"' | tr -d "'" | tr -d '[:space:]'
-}
-
-# Collect upstream names and protocols from the config for the startup banner.
-_upstream_summary() {
-    awk "/\[\[upstreams/{if(name!=\"\")print name\"(\"proto\")\";name=\"\";proto=\"\"} /name *= *\"/{n=\$0;sub(/.*= *\"/,\"\",n);sub(/\".*/,\"\",n);name=n} /doq *= *true/{proto=\"DoQ\"} /dot *= *true/{proto=\"DoT\"} /doh *= *true/{proto=\"DoH\"} END{if(name!=\"\")print name\"(\"proto\")\"}" \
-        "${RCVD_CONF}" | paste -sd ',' -
+	need net
+	after firewall
+	use logger
+	provide dns
 }
 
 start_pre() {
-    # Create runtime directory for stats socket, owned by the rcvd user.
-    # /run is tmpfs — must be (re)created on each boot.
-    checkpath --directory --owner rcvd:rcvd --mode 0755 /run/rcvd
-
-    # Create log directory on /var/log (tmpfs on Alpine), owned by the rcvd user.
-    # The log file is created empty; rcvd appends to it.
-    checkpath --directory --owner rcvd:rcvd --mode 0755 /var/log/rcvd
-    touch /var/log/rcvd/rcvd.log
-    chown rcvd:rcvd /var/log/rcvd/rcvd.log
-    chmod 0640 /var/log/rcvd/rcvd.log
-
-    # Increase UDP buffer sizes for quic-go (DoQ performance).
-    # quic-go wants 7168 KiB; Alpine default is 208 KiB.
-    sysctl -qw net.core.rmem_max=7340032
-    sysctl -qw net.core.wmem_max=7340032
-
-    # Build startup banner from config
-    _listen=$(_toml_get listen)
-    _upstreams=$(_upstream_summary)
-    _cache=$(   _toml_get max_size)
-    _stats=$(   _toml_get stats_enabled)
-    _blocklist=$(_toml_get "files" | grep -c '\.' 2>/dev/null || echo 0)
-
-    _extras=""
-    [ "${_cache}"  != "" ]    && _extras="${_extras} cache=${_cache}"
-    [ "${_stats}"  = "true" ] && _extras="${_extras} stats=on"
-    [ "$(_toml_get "enabled" | head -1)" = "true" ] && \
-        grep -q "^\[blocklists\]" "${RCVD_CONF}" 2>/dev/null && \
-        _extras="${_extras} blocklist=on"
-
-    # Show the EXACT config file this instance loads, resolved to an absolute path.
-    # Multiple rcvd instances can run on one host, each with a different config —
-    # printing the path here removes all ambiguity about which instance is which.
-    # (rcvd itself also logs this to its log file; see "RCVD instance — config:".)
-    _conf_abs="$(readlink -f "${RCVD_CONF}" 2>/dev/null || echo "${RCVD_CONF}")"
-    einfo "RCVD: config=${_conf_abs}"
-    einfo "RCVD: listen=${_listen} upstreams=${_upstreams}${_extras}"
+	# /run and /var/log are tmpfs on Alpine — recreate the runtime dirs each boot.
+	# /run/rcvd holds the stats socket; the log dir/file are created empty.
+	checkpath --directory --owner "${command_user}" --mode 0755 /run/rcvd
+	checkpath --directory --owner "${command_user}" --mode 0755 /var/log/rcvd
+	checkpath --file --owner "${command_user}" --mode 0640 /var/log/rcvd/rcvd.log
 }
