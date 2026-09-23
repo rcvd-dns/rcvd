@@ -42,6 +42,11 @@ var (
 	buildSource = "local"
 )
 
+// displayVersion returns the version with exactly one leading "v".
+func displayVersion() string {
+	return "v" + strings.TrimPrefix(version, "v")
+}
+
 // vcsRevision returns the git commit the binary was built from, read from the
 // build metadata Go embeds automatically (runtime/debug.ReadBuildInfo). No
 // -ldflags stamping is required: any `go build` inside a git checkout records
@@ -108,9 +113,9 @@ func main() {
 		// which carries no .git) — a bare "commit unknown" is just noise. Git
 		// builds (dev / CI) still show the revision.
 		if rev := vcsRevision(); rev != "unknown" {
-			fmt.Printf("RCVD v%s (built %s, source %s, commit %s)\n", version, buildDate, buildSource, rev)
+			fmt.Printf("RCVD %s (built %s, source %s, commit %s)\n", displayVersion(), buildDate, buildSource, rev)
 		} else {
-			fmt.Printf("RCVD v%s (built %s, source %s)\n", version, buildDate, buildSource)
+			fmt.Printf("RCVD %s (built %s, source %s)\n", displayVersion(), buildDate, buildSource)
 		}
 		os.Exit(0)
 	}
@@ -247,7 +252,7 @@ func main() {
 		appLogger = logger.New(cfg.Logging.Level, logFile)
 	}
 
-	appLogger.Printf("starting RCVD v%s — Resilient, Cryptographic, Verifiable DNS\n", version)
+	appLogger.Printf("starting RCVD %s — Resilient, Cryptographic, Verifiable DNS\n", displayVersion())
 
 	// Announce this instance's identity unambiguously. Multiple rcvd instances can
 	// run on one host, each with a different config file (and thus a different stats
@@ -461,7 +466,7 @@ func main() {
 					return len(files)
 				}
 			}
-			if err := statistics.ListenAndServe(statsCtx, socketPath, stats, version, cacheInfo, statusInfo, listenerInfo, instInfo, auditInfo, reloadInfo); err != nil {
+			if err := statistics.ListenAndServe(statsCtx, socketPath, stats, displayVersion(), cacheInfo, statusInfo, listenerInfo, instInfo, auditInfo, reloadInfo); err != nil {
 				appLogger.Printf("stats socket error: %v", err)
 			}
 		}()
