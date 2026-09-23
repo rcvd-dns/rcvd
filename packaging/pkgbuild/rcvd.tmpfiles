@@ -1,0 +1,5 @@
+# rcvd writes its log to /var/log/rcvd/rcvd.log by default (see internal/config:
+# Logging.File defaults to that path, and rcvd fails to start if the directory is
+# absent). systemd-tmpfiles creates it at install time and on every boot, owned by
+# the rcvd service user.
+d /var/log/rcvd 0750 rcvd rcvd -

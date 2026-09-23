@@ -6,7 +6,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/bash -c 'touch /var/log/rcvd/rcvd.log && chown rcvd:rcvd /var/log/rcvd/rcvd.log && chmod 0640 /var/log/rcvd/rcvd.log'
 ExecStart=/usr/local/bin/rcvd -config /etc/rcvd/rcvd.toml
 Restart=on-failure
 RestartSec=5
@@ -17,9 +16,10 @@ Group=rcvd
 RuntimeDirectory=rcvd
 LogsDirectory=rcvd
 
-# Capture stdout/stderr to log file
-StandardOutput=file:/var/log/rcvd/rcvd.log
-StandardError=file:/var/log/rcvd/rcvd.log
+# rcvd writes its own log to /var/log/rcvd/rcvd.log (LogsDirectory= creates that
+# dir owned by rcvd). systemd's own stdout/stderr go to the journal by default.
+# Do NOT use StandardOutput=file: here - systemd opens that path before ExecStart,
+# which fails (209/STDOUT) if the dir/file is not present yet.
 
 # Filesystem isolation
 ProtectSystem=strict

@@ -1,0 +1,12 @@
+post_install() {
+  # The rcvd service user is created automatically by the sysusers pacman hook
+  # from the shipped usr/lib/sysusers.d/rcvd.conf. Nothing to do here but inform.
+  echo ""
+  echo ":: rcvd installed with a default config at /etc/rcvd/rcvd.toml"
+  echo "   (encrypted forwarder; other profiles in /usr/share/doc/rcvd/examples/)."
+  echo "   Review it, then: systemctl enable --now rcvd"
+}
+
+post_upgrade() {
+  post_install
+}

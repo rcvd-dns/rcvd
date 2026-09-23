@@ -1,0 +1,4 @@
+# System user the rcvd service runs as (see packaging/systemd/rcvd.service).
+# systemd-sysusers creates it; the systemd unit's LogsDirectory=/RuntimeDirectory=
+# then own /var/log/rcvd and /run/rcvd to this user at start.
+u rcvd - "rcvd DNS service" /var/empty /usr/bin/nologin
