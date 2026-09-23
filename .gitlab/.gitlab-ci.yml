@@ -7,7 +7,7 @@
 # image with no C toolchain — the same recipe as scripts/ (static, stripped,
 # -trimpath), plus provenance stamped into --version (buildSource=gitlab-runner).
 
-image: docker.io/library/golang:1.26.4-alpine
+image: docker.io/library/golang:1.27-alpine
 
 stages:
   - test
