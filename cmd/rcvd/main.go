@@ -34,13 +34,13 @@ import (
 // local build so that even a bare `go build ./cmd/rcvd` self-reports honestly.
 //
 //	version     — release version, normally the git tag (e.g. "0.1.0").
-//	              Default "0.1.0-dev" marks an untagged development build.
+//	              Default "0.3.0-dev" marks an untagged development build.
 //	buildDate   — UTC build timestamp (RFC 3339), e.g. "2026-07-07T10:00:00Z".
 //	buildSource — what produced the binary: "local" (a developer machine),
 //	              "github-runner", "gitlab-runner", etc. Lets anyone inspect an
 //	              artifact and know its provenance.
 var (
-	version     = "0.1.0-dev"
+	version     = "0.3.0-dev"
 	buildDate   = "unknown"
 	buildSource = "local"
 )
@@ -48,6 +48,25 @@ var (
 // displayVersion returns the version with exactly one leading "v".
 func displayVersion() string {
 	return "v" + strings.TrimPrefix(version, "v")
+}
+
+// buildString is the version plus the commit and build date, e.g.
+// "v0.3.0-dev (commit fbdbb37687c7, built 2026-09-28T13:17:34Z)". The running
+// daemon reports it via --stats/--audit, so an operator can tell which build a
+// long-lived process is running even after the binary on disk was replaced.
+// Unknown fields are omitted.
+func buildString() string {
+	var parts []string
+	if rev := vcsRevision(); rev != "unknown" {
+		parts = append(parts, "commit "+rev)
+	}
+	if buildDate != "unknown" {
+		parts = append(parts, "built "+buildDate)
+	}
+	if len(parts) == 0 {
+		return displayVersion()
+	}
+	return displayVersion() + " (" + strings.Join(parts, ", ") + ")"
 }
 
 // vcsRevision returns the git commit the binary was built from, read from the
@@ -525,7 +544,7 @@ func main() {
 					return reply, nil
 				}
 			}
-			if err := statistics.ListenAndServe(statsCtx, socketPath, stats, displayVersion(), cacheInfo, statusInfo, listenerInfo, instInfo, auditInfo, reloadInfo, allowlistReloadInfo); err != nil {
+			if err := statistics.ListenAndServe(statsCtx, socketPath, stats, buildString(), cacheInfo, statusInfo, listenerInfo, instInfo, auditInfo, reloadInfo, allowlistReloadInfo); err != nil {
 				appLogger.Printf("stats socket error: %v", err)
 			}
 		}()
