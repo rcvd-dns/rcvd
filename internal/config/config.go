@@ -19,6 +19,7 @@ type Config struct {
 	Upstreams       []UpstreamServer    `toml:"upstreams"`
 	DNSSEC          DNSSECConfig        `toml:"dnssec"`
 	Blocklists      BlocklistConfig     `toml:"blocklists"`
+	Allowlist       AllowlistConfig     `toml:"allowlist"`
 	Cache           CacheConfig         `toml:"cache"`
 	Metrics         MetricsConfig       `toml:"metrics"` // RESERVED — not yet implemented (Prometheus endpoint deferred; internal/metrics/metrics.go not built)
 	Logging         LoggingConfig       `toml:"logging"`
@@ -84,7 +85,7 @@ type UpstreamConfig struct {
 	TLSCertAutoGen bool     `toml:"tls_cert_autogen"` // self-signed, NEW KEY EVERY START: dev/test or behind a trust-terminating proxy; not direct-browser, not mobile, not compatible with SPKI pinning
 	// TLSCertHosts adds extra hostnames/IPs to the self-signed (tls_cert_autogen) cert's SAN,
 	// on top of the auto-derived listen-address hosts + loopback. Use it when clients connect by
-	// a name that isn't the bind address — e.g. a tunnel hostname (doh-dev.rcvd.net) or a LAN
+	// a name that isn't the bind address — e.g. a tunnel hostname (doh.example.net) or a LAN
 	// hostname (router.lan). IP literals go in the IP SAN, names in the DNS SAN. Ignored unless
 	// tls_cert_autogen is set (real certs come from tls_automation / your own cert files).
 	TLSCertHosts  []string `toml:"tls_cert_hosts"`
@@ -151,6 +152,26 @@ type BlocklistConfig struct {
 	Files          []string `toml:"files"`           // local files (plain domain list or hosts format)
 	UpdateURLs     []string `toml:"update_urls"`     // fetch fresh lists
 	UpdateInterval string   `toml:"update_interval"` // RESERVED — not yet implemented (pairs with deferred SIGHUP/periodic blocklist reload)
+}
+
+// AllowlistConfig — default-deny name filtering for Mode 1 and Mode 2.
+//
+// When enabled, only names under listed suffixes resolve; every other name is
+// answered locally (REFUSED + EDE 18) and never forwarded, on whichever
+// transports are configured (UDP/TCP for Mode 1, DoH/DoT/DoQ for Mode 2).
+// Enforcement goes through the shared internal/policy package so both modes
+// make identical decisions and the allowlist cannot be bypassed by switching
+// transports.
+//
+// Enabled and Mode are read on the running path; the synchronous load lives in
+// cmd/rcvd/main.go so a failed load is a startup error, not a silent gap.
+// Mode "exempt" is reserved for a future Pi-hole-style exemption feature and
+// is rejected at validation today — keeping the enum honest from day one rather
+// than treating an unknown value as no-op.
+type AllowlistConfig struct {
+	Enabled bool     `toml:"enabled"` // default: false
+	Mode    string   `toml:"mode"`    // required when enabled; only "default-deny" is implemented
+	Files   []string `toml:"files"`   // one or more plain domain lists (one domain per line, # comments, blank lines ignored); entries from all files are merged, and a bad line in any file fails the whole load
 }
 
 // CacheConfig — DNS response caching.
@@ -650,6 +671,16 @@ func (c *Config) validate(requireToken bool) error {
 		return err
 	}
 
+	// Allowlist: validate required fields when enabled. Mode "exempt" is reserved
+	// for a future Pi-hole-style exemption feature — rejected today so the enum
+	// stays honest instead of silently treating an unknown value as no-op. Files
+	// required when enabled: the strict loader rejects an empty file (and a
+	// missing file) at startup, so an empty list or a typo'd path fails loudly
+	// rather than silently cutting the host off from DNS.
+	if err := c.validateAllowlist(); err != nil {
+		return err
+	}
+
 	// DNSSEC trust anchors: when enabled, main loads cfg.DNSSEC.RootKeyFile if set,
 	// otherwise the embedded IANA root-anchors.xml. Existence/parse of the file is
 	// checked at load time (below) so a bad path fails fast rather than silently
@@ -740,6 +771,32 @@ func (c *Config) validateTLSAutomation(requireToken bool) error {
 				"dns_api_token, dns_api_token_env, or dns_api_token_file")
 	}
 
+	return nil
+}
+
+// validateAllowlist enforces the allowlist fields' required shape. A no-op when
+// disabled (so a placeholder [allowlist] block is harmless); rejects unknown
+// modes and the reserved "exempt" value; requires Files when enabled. Cross-mode
+// enforcement is a daemon concern (cmd/rcvd/main.go builds one *policy.Policy
+// and hands it to both the Mode 1 server and the Mode 2 service), not a config
+// validation concern.
+func (c *Config) validateAllowlist() error {
+	a := c.Allowlist
+	if !a.Enabled {
+		return nil
+	}
+	if a.Mode == "" {
+		return fmt.Errorf("allowlist.mode is required (\"default-deny\") when allowlist is enabled")
+	}
+	if a.Mode == "exempt" {
+		return fmt.Errorf("allowlist.mode = \"exempt\" is reserved for a future feature and is not implemented")
+	}
+	if a.Mode != "default-deny" {
+		return fmt.Errorf("allowlist.mode %q is not implemented (only \"default-deny\" is supported)", a.Mode)
+	}
+	if len(a.Files) == 0 {
+		return fmt.Errorf("allowlist.files is required when allowlist is enabled (one or more plain-domain-list files)")
+	}
 	return nil
 }
 

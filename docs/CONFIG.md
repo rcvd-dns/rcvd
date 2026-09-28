@@ -45,7 +45,7 @@ enabled = true
 max_size = 4096
 ```
 
-When both modes run in one process, they share the same cache, blocklist, DNSSEC validator, and statistics. A cache hit from a Mode 1 query is immediately available to a Mode 2 query.
+When both modes run in one process, they share the same cache, blocklist, allowlist, DNSSEC validator, and statistics. A cache hit from a Mode 1 query is immediately available to a Mode 2 query.
 
 **Alternatively, run two separate processes** with different config files for fault isolation (recommended for internet-facing Mode 2):
 
@@ -568,6 +568,8 @@ update_interval = "12h"        # How often to fetch fresh lists
 - Never returns a fake IP address (maintains DNS integrity)
 - Blocked queries increment the aggregate "Blocked (NXDOMAIN)" statistic — the blocked
   domain name itself is never logged
+- Applies to every listener: Mode 1 (UDP/TCP) and Mode 2 (DoH/DoT/DoQ)
+- With an allowlist enabled, the blocklist still wins inside allowed names (NXDOMAIN)
 
 **Hot-reload (`rcvd -blocklist-reload`):**
 - Edit the `files` on disk, then run `rcvd -config … -blocklist-reload` to reload them
@@ -579,6 +581,76 @@ update_interval = "12h"        # How often to fetch fresh lists
   paused. Final counts land in the daemon log when the swap completes.
 - Only local `files` are reloaded; `update_urls` are not re-fetched. Requires `stats_enabled = true`
   (it uses the same Unix socket as `-stats`/`-audit`).
+
+---
+
+## Allowlists
+
+### `[allowlist]` — Default-Deny Name Filtering
+
+```toml
+[allowlist]
+enabled = true                 # default: false
+mode    = "default-deny"       # required when enabled
+files   = [
+  "/etc/rcvd/allow.txt",
+  "/etc/rcvd/allow-temp.txt"
+]
+```
+
+The inverse of a blocklist: only names under a listed suffix resolve. Every other name is
+answered locally and never leaves the host. Intended for sandboxes, CI runners, build
+containers, and other hosts whose DNS egress should be limited to a known set of domains.
+See `docs/SANDBOX-EGRESS.md` for a full deployment guide including firewall rules.
+
+**Options:**
+- `enabled` (bool, optional) — Enable the allowlist
+  - Default: `false`
+
+- `mode` (string, required when enabled) — Only `"default-deny"` is implemented
+  - `"exempt"` is reserved and rejected; any other value is a startup error
+
+- `files` (list of strings, required when enabled) — One or more allowlist files
+  - Entries from all files are merged. A narrow base list plus a broader temporary list
+    is a supported pattern.
+  - Format: one domain per line; `#` comments and blank lines are ignored
+  - `example.com` allows the apex and every name below it
+  - `*.example.com` allows names below it, but not the apex
+  - Rejected at load time: bare TLDs, hosts-file lines (`0.0.0.0 example.com`), names with
+    underscore labels, and malformed names. The error names the file and line.
+
+**Allowlist Behavior:**
+- Denied names get **REFUSED**. If the query carried EDNS, the reply includes an RFC 8914
+  Extended DNS Error, code 18 (Prohibited).
+- Denied queries are never forwarded upstream and never cached.
+- Applies to every listener: Mode 1 (UDP/TCP) and Mode 2 (DoH/DoT/DoQ).
+- Evaluation order: malformed query (FORMERR) → DDR `resolver.arpa` (Mode 2 only, answered
+  locally) → allowlist → blocklist → cache → upstream. A blocklisted name inside an allowed
+  suffix gets NXDOMAIN.
+- Listing the same name in both lists is not an error. The blocklist wins, and rcvd logs one
+  warning naming the allowlist entries the blocklist fully covers (checked after each blocklist
+  load or reload and each allowlist reload). A blocked subdomain under an allowed name is normal
+  use and does not warn.
+- Fails closed: the list loads before any listener starts. A missing file, an invalid line, or
+  zero entries across all files stops rcvd from starting. It never runs open while loading
+  (unlike the blocklist, which resolves normally until its load finishes).
+- Denied queries increment the aggregate "Denied (allowlist)" statistic — the denied domain
+  name itself is never logged.
+
+**Reload (`rcvd -allowlist-reload`):**
+- Edit the `files` on disk, then run `rcvd -config … -allowlist-reload`. The list is re-read and
+  swapped in atomically, with no restart.
+- Synchronous: the command waits for the result.
+  - Success prints `allowlist reloaded: N entries from M file(s)` and exits 0.
+  - Failure prints `allowlist reload FAILED, previous list still active: <file:line: reason>`
+    and exits 1. The previous list keeps serving; a bad edit never widens or empties it.
+  - With the allowlist disabled it prints `allowlist reload unavailable: allowlist not enabled`
+    and exits 1.
+- Names removed from the list are refused immediately, even if an answer is cached.
+- Reload re-reads the paths configured at startup. To retire a temporary list without a restart,
+  empty the file (comments only) and reload; deleting the file makes the reload fail. Adding or
+  removing paths in `files` needs a restart.
+- Requires `stats_enabled = true` (it uses the same Unix socket as `-stats`/`-audit`).
 
 ---
 
@@ -648,10 +720,10 @@ Latency
 - "Protocol Breakdown (Inbound, Mode 2)" = clients connected to rcvd's encrypted endpoints. Only shown when Mode 2 has served at least one query.
 - Statistics are in-memory only — reset on restart.
 - The socket path is derived from the config file path: `/run/rcvd/<config-name>.sock`
-- This one socket is the daemon's control channel for **all** of `-stats`, `-audit`, and
-  `-blocklist-reload`. Setting `stats_enabled = false` disables the socket entirely, so **`-audit`
-  and live blocklist reload stop working too** — not just `-stats`. With the socket off, the only way
-  to pick up blocklist file edits is a full process restart.
+- This one socket is the daemon's control channel for **all** of `-stats`, `-audit`,
+  `-blocklist-reload`, and `-allowlist-reload`. Setting `stats_enabled = false` disables the socket
+  entirely, so **`-audit` and live blocklist/allowlist reload stop working too** — not just `-stats`.
+  With the socket off, the only way to pick up blocklist or allowlist file edits is a full process restart.
 
 ---
 

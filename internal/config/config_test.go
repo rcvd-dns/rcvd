@@ -3,6 +3,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -561,7 +562,7 @@ func TestAdvertiseIPsValidation(t *testing.T) {
 	}
 
 	// A hostname is rejected: SVCB hints are addresses, and nothing resolves this.
-	if _, err := Load(writeTempConfig(t, svc("advertise_ips = [\"doh3.qa.rcvd.net\"]\n"))); err == nil {
+	if _, err := Load(writeTempConfig(t, svc("advertise_ips = [\"doh3.example.net\"]\n"))); err == nil {
 		t.Error("hostname in advertise_ips should error")
 	}
 
@@ -581,5 +582,144 @@ func TestAdvertiseIPsValidation(t *testing.T) {
 	noListener := baseUpstream + "\n[upstream_service]\nenabled = true\ntls_cert_autogen = true\nadvertise_ips = [\"203.0.113.9\"]\n"
 	if _, err := Load(writeTempConfig(t, noListener)); err == nil {
 		t.Error("advertise_ips with no encrypted listener should error")
+	}
+}
+
+// --- [allowlist] validation -------------------------------------------------
+//
+// table-driven over the same baseUpstream config + an [allowlist] block. The
+// block is left disabled for the by-default case so the operator can drop a
+// commented-out [allowlist] stub into the config without configuring it.
+func TestAllowlistValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string // extra lines appended to the base config (always prepended with baseUpstream)
+		wantErr   bool
+		errSubstr string // substring expected in the error message
+	}{
+		{
+			name: "disabled (no block) is a no-op",
+			body: "",
+		},
+		{
+			name: "disabled (explicit enabled=false) is a no-op",
+			body: "\n[allowlist]\nenabled = false\nmode = \"\"\nfiles = []\n",
+		},
+		{
+			name: "valid enabled config passes",
+			body: "\n[allowlist]\nenabled = true\nmode = \"default-deny\"\nfiles = [\"/etc/rcvd/allowlist.txt\"]\n",
+		},
+		{
+			name:      "missing mode is a hard error",
+			body:      "\n[allowlist]\nenabled = true\nfiles = [\"/etc/rcvd/allowlist.txt\"]\n",
+			wantErr:   true,
+			errSubstr: "allowlist.mode is required",
+		},
+		{
+			name:      "unknown mode is a hard error",
+			body:      "\n[allowlist]\nenabled = true\nmode = \"permissive\"\nfiles = [\"/etc/rcvd/allowlist.txt\"]\n",
+			wantErr:   true,
+			errSubstr: "not implemented",
+		},
+		{
+			name:      "exempt mode is reserved and rejected",
+			body:      "\n[allowlist]\nenabled = true\nmode = \"exempt\"\nfiles = [\"/etc/rcvd/allowlist.txt\"]\n",
+			wantErr:   true,
+			errSubstr: "reserved",
+		},
+		{
+			name:      "missing files is a hard error",
+			body:      "\n[allowlist]\nenabled = true\nmode = \"default-deny\"\nfiles = []\n",
+			wantErr:   true,
+			errSubstr: "allowlist.files is required",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := baseUpstream + tc.body
+			_, err := Load(writeTempConfig(t, body))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.errSubstr)
+				}
+				if tc.errSubstr != "" && !strings.Contains(err.Error(), tc.errSubstr) {
+					t.Errorf("error must contain %q, got: %v", tc.errSubstr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("expected no error, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestAllowlistMode2OnlyAccepted covers the current behavior: a Mode-2-only
+// deployment (resolver disabled) with the allowlist enabled must validate and
+// load clean — the shared policy package wires the allowlist into every Mode 2
+// listener, so the earlier "Mode 2 not enforced yet" guard is no longer needed.
+func TestAllowlistMode2OnlyAccepted(t *testing.T) {
+	body := `
+[resolver]
+enabled = false
+[upstream_service]
+enabled = true
+listen_doq = "127.0.0.1:8853"
+tls_cert_autogen = true
+[[upstreams]]
+name = "T"
+host = "1.1.1.1"
+port = 853
+doq = true
+[allowlist]
+enabled = true
+mode = "default-deny"
+files = ["/etc/rcvd/allowlist.txt"]
+`
+	if _, err := Load(writeTempConfig(t, body)); err != nil {
+		t.Errorf("mode-2-only + allowlist should validate now (shared policy wires enforcement), got: %v", err)
+	}
+}
+
+// TestAllowlistAndBlocklistBothEnabled: one config with both filters on is a
+// supported combination, not a conflict. It must validate and keep both enabled.
+func TestAllowlistAndBlocklistBothEnabled(t *testing.T) {
+	body := baseUpstream + `
+[blocklists]
+enabled = true
+files = ["/etc/rcvd/blocklist.txt"]
+[allowlist]
+enabled = true
+mode = "default-deny"
+files = ["/etc/rcvd/allowlist.txt"]
+`
+	cfg, err := Load(writeTempConfig(t, body))
+	if err != nil {
+		t.Fatalf("allowlist + blocklist together must validate, got: %v", err)
+	}
+	if !cfg.Blocklists.Enabled || !cfg.Allowlist.Enabled {
+		t.Errorf("both filters must stay enabled: blocklists=%v allowlist=%v",
+			cfg.Blocklists.Enabled, cfg.Allowlist.Enabled)
+	}
+}
+
+// TestAllowlistWithMode1AndMode2Passes covers the dual-mode router case: both
+// modes on, allowlist enabled. Must load clean — the shared policy enforces the
+// allowlist on every transport (Mode 1 UDP/TCP, Mode 2 DoH/DoT/DoQ), so there is
+// no longer a "Mode 2 not enforced" exception to guard against.
+func TestAllowlistWithMode1AndMode2Passes(t *testing.T) {
+	body := baseUpstream + `
+[upstream_service]
+enabled = true
+listen_doq = "127.0.0.1:8853"
+tls_cert_autogen = true
+[allowlist]
+enabled = true
+mode = "default-deny"
+files = ["/etc/rcvd/allowlist.txt"]
+`
+	if _, err := Load(writeTempConfig(t, body)); err != nil {
+		t.Errorf("dual-mode + allowlist should load, got: %v", err)
 	}
 }

@@ -27,7 +27,7 @@ import (
 // serverNameOverride sets the TLS SNI for the probe. Precedence when it is empty: the DoH
 // listener falls back to the first tls_automation hostname (dohHostname, from allowed_domains)
 // when its bind is an IP — so a real public deployment probes the actual cert (e.g.
-// doh-dev.rcvd.net) instead of the "localhost" autogen SAN, with no need to remember
+// doh.example.net) instead of the "localhost" autogen SAN, with no need to remember
 // -server-name. Absent both, the SNI is derived from the listener's configured host (falling
 // back to "localhost", which the autogen SAN always covers).
 //

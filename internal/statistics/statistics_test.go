@@ -32,6 +32,7 @@ func TestAtomicCounters(t *testing.T) {
 	atomic.AddInt64(&s.TotalQueries, 1)
 	atomic.AddInt64(&s.CacheHits, 5)
 	atomic.AddInt64(&s.BlockedQueries, 3)
+	atomic.AddInt64(&s.DeniedQueries, 7)
 	atomic.AddInt64(&s.ServfailResponses, 2)
 
 	if got := atomic.LoadInt64(&s.TotalQueries); got != 2 {
@@ -42,6 +43,9 @@ func TestAtomicCounters(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&s.BlockedQueries); got != 3 {
 		t.Errorf("BlockedQueries: expected 3, got %d", got)
+	}
+	if got := atomic.LoadInt64(&s.DeniedQueries); got != 7 {
+		t.Errorf("DeniedQueries: expected 7, got %d", got)
 	}
 	if got := atomic.LoadInt64(&s.ServfailResponses); got != 2 {
 		t.Errorf("ServfailResponses: expected 2, got %d", got)
@@ -252,6 +256,79 @@ func TestRenderModeSectionsConditionalAndOrdered(t *testing.T) {
 	}
 	if i1 > i2 {
 		t.Errorf("dual-mode: MODE-1 must render before MODE-2 (got M1@%d, M2@%d)", i1, i2)
+	}
+}
+
+// TestRenderAllowlistLine verifies the FILTERING block shows the
+// "Denied (allowlist):" line when the count is non-zero OR the allowlist is
+// configured on (a configured-on, zero-count install still surfaces the
+// feature so the operator can see it), and hides it when both are false (a
+// passive operator sees no noise). The qname is never logged — only the count.
+func TestRenderAllowlistLine(t *testing.T) {
+	render := func(allowlistEnabled bool, denied int64) string {
+		s := New()
+		atomic.AddInt64(&s.DeniedQueries, denied)
+		snap := s.TakeSnapshot(0, 0, InstanceInfo{AllowlistEnabled: allowlistEnabled})
+		return snap.Render("v")
+	}
+
+	// allowlist on, zero denials — the line still appears so the operator
+	// sees the feature is active.
+	out := render(true, 0)
+	if !strings.Contains(out, "Denied (allowlist):") {
+		t.Errorf("allowlist on: line must render even with zero count, got:\n%s", out)
+	}
+
+	// allowlist on, with some denials.
+	out = render(true, 42)
+	if !strings.Contains(out, "Denied (allowlist):") {
+		t.Errorf("allowlist on: line must render with non-zero count")
+	}
+	if !strings.Contains(out, "42") {
+		t.Errorf("count must appear in render")
+	}
+
+	// allowlist off, zero denials — the line must NOT appear (passive case).
+	out = render(false, 0)
+	if strings.Contains(out, "Denied (allowlist):") {
+		t.Errorf("allowlist off + no denials: line must be omitted, got:\n%s", out)
+	}
+
+	// allowlist off, some denials — line still appears (count is non-zero).
+	// In production this case is unreachable (denials only fire through the
+	// allowlist), but the spec explicitly says "OR the counter is non-zero,
+	// whichever is simpler to wire cleanly" — so the count wins and the line
+	// renders to give the operator visibility into unexpected denials.
+	out = render(false, 42)
+	if !strings.Contains(out, "Denied (allowlist):") {
+		t.Errorf("allowlist off + non-zero count: line must render (counter is non-zero), got:\n%s", out)
+	}
+}
+
+// TestRenderAllowlistLinePlacement verifies the Denied line sits directly
+// under "Blocked (NXDOMAIN):" in the FILTERING block, so an operator scanning
+// the section sees them adjacent.
+func TestRenderAllowlistLinePlacement(t *testing.T) {
+	s := New()
+	atomic.AddInt64(&s.DeniedQueries, 3)
+	snap := s.TakeSnapshot(0, 0, InstanceInfo{AllowlistEnabled: true})
+	out := snap.Render("v")
+
+	bi := strings.Index(out, "Blocked (NXDOMAIN):")
+	di := strings.Index(out, "Denied (allowlist):")
+	if bi < 0 || di < 0 {
+		t.Fatalf("both lines must render; bi=%d di=%d", bi, di)
+	}
+	if di <= bi {
+		t.Errorf("Denied line must appear AFTER Blocked line; got bi=%d di=%d", bi, di)
+	}
+	// The two lines must be near each other (no other section in between).
+	// Filter block ends with a blank line; the next section ("RCVD Statistics"
+	// header) sits above. We assert di comes right after bi, before the next
+	// section break.
+	between := out[bi:di]
+	if strings.Contains(between, "\n\n") {
+		t.Errorf("Blocked and Denied must be adjacent (no blank line between), got:\n%s", between)
 	}
 }
 

@@ -70,7 +70,7 @@ func TestDoQResponseMatchesQuery(t *testing.T) {
 // TestDoQResponseUsable is the deterministic guard for the ISSUES 31 empty-answer-on-retry
 // break: a stale-conn DoQ retry can return a frame that parses and echoes the question but
 // carries no usable answer (truncated, or an empty NOERROR with no SOA). The field symptom was
-// an iOS DoH client (pointed at the rcvd-roam tunnel) getting NOERROR/ans=0 for github.com/A —
+// an iOS DoH client (pointed at a roaming DoH tunnel) getting NOERROR/ans=0 for github.com/A —
 // an address-less "success" that breaks page loads. These must be rejected (retryable), while a
 // legitimate NODATA (empty answer WITH an SOA) and a normal answer must pass.
 func TestDoQResponseUsable(t *testing.T) {

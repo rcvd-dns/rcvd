@@ -131,8 +131,8 @@ func TestVerifySelf_NoListeners(t *testing.T) {
 func TestFormatSelfResults_ShowsDoHHostname(t *testing.T) {
 	// The configured DoH hostname must appear in the header when present, and be
 	// absent (no empty "DoH hostname:" line) when not.
-	with := formatSelfResults("/etc/rcvd/rcvd-roam.toml", "doh-dev.rcvd.net", nil)
-	if !strings.Contains(with, "DoH hostname: doh-dev.rcvd.net") {
+	with := formatSelfResults("/etc/rcvd/rcvd-doh.toml", "doh.example.net", nil)
+	if !strings.Contains(with, "DoH hostname: doh.example.net") {
 		t.Errorf("expected the DoH hostname in the header, got:\n%s", with)
 	}
 	without := formatSelfResults("/etc/rcvd/rcvd.toml", "", nil)

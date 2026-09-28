@@ -40,7 +40,7 @@ func TestAutogenSANHosts(t *testing.T) {
 func TestAutogenSANHostsExtraHosts(t *testing.T) {
 	cfg := &config.UpstreamConfig{
 		ListenDoH:    "0.0.0.0:8443", // unspecified bind — not a meaningful SAN on its own
-		TLSCertHosts: []string{"doh-dev.rcvd.net", "192.0.2.10"},
+		TLSCertHosts: []string{"doh.example.net", "192.0.2.10"},
 	}
 	hosts := autogenSANHosts(cfg)
 
@@ -48,7 +48,7 @@ func TestAutogenSANHostsExtraHosts(t *testing.T) {
 	for _, h := range hosts {
 		got[h] = true
 	}
-	for _, w := range []string{"doh-dev.rcvd.net", "192.0.2.10", "127.0.0.1", "localhost"} {
+	for _, w := range []string{"doh.example.net", "192.0.2.10", "127.0.0.1", "localhost"} {
 		if !got[w] {
 			t.Errorf("expected SAN host %q in %v", w, hosts)
 		}

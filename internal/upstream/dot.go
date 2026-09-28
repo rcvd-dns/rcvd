@@ -15,6 +15,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/rcvd-dns/rcvd/internal/cache"
+	"github.com/rcvd-dns/rcvd/internal/policy"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
 )
@@ -34,7 +35,8 @@ type DOTListener struct {
 	done         chan struct{}
 	closeOnce    sync.Once // guards Close (idempotent without racing Serve's field reads)
 
-	ddr ddrZone // RFC 9462 resolver.arpa zone: designations + §6.4 containment
+	ddr    ddrZone        // RFC 9462 resolver.arpa zone: designations + §6.4 containment
+	policy *policy.Policy // shared with Mode 1: allowlist+blocklist. nil = enforcement off.
 }
 
 // NewDOTListener creates a new DoT listener.
@@ -80,6 +82,10 @@ func NewDOTListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 		done:         make(chan struct{}),
 	}, nil
 }
+
+// SetPolicy wires the shared policy (allowlist + blocklist + stats) into the listener.
+// Must be called before Serve. nil disables enforcement.
+func (d *DOTListener) SetPolicy(p *policy.Policy) { d.policy = p }
 
 // Serve accepts and handles DoT connections.
 // Blocks until context is cancelled.
@@ -234,11 +240,16 @@ func (d *DOTListener) handleConnection(conn net.Conn, ctx context.Context) {
 				},
 				Question: query.Question,
 			}
-		} else {
+		} else if resp := d.ddr.answer(query); resp != nil {
 			// DDR (RFC 9462): resolver.arpa is served locally in its entirety — the SVCB
 			// probe gets rcvd's designations, everything else in the zone gets NODATA. nil
 			// means the query is not for that zone and falls through to normal resolution.
-			response = d.ddr.answer(query)
+			response = resp
+		} else if resp := d.policy.Response(query); resp != nil {
+			// Policy (shared with Mode 1): same allowlist+blocklist decision every
+			// transport must enforce in lockstep. Runs BEFORE the cache so a denied
+			// qname is never served from a positive answer and never reaches upstream.
+			response = resp
 		}
 
 		// SHARED CACHE check (same object as Mode 1).

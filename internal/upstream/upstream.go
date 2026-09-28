@@ -33,6 +33,7 @@ import (
 	"github.com/rcvd-dns/rcvd/internal/config"
 	"github.com/rcvd-dns/rcvd/internal/dnssec"
 	applog "github.com/rcvd-dns/rcvd/internal/logger"
+	"github.com/rcvd-dns/rcvd/internal/policy"
 	rcvd_tls "github.com/rcvd-dns/rcvd/internal/rcvd_tls"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
@@ -165,6 +166,7 @@ type Service struct {
 	cache         *cache.Cache      // SHARED with Mode 1 — one cache for the whole instance (may be nil)
 	validator     *dnssec.Validator // optional DNSSEC validator
 	stats         *statistics.Stats // optional runtime statistics
+	policy        *policy.Policy    // shared with Mode 1: allowlist+blocklist enforced on every listener
 	tlsConfig     *tls.Config
 	tlsManager    *rcvd_tls.Manager // certmagic automation manager (if enabled)
 	logger        *log.Logger
@@ -289,6 +291,11 @@ func (s *Service) setupTLS(fullConfig *config.Config) (*tls.Config, *rcvd_tls.Ma
 // Start (the listener is created there). nil / unset keeps the prior always-on behavior.
 func (s *Service) SetDebugLogger(l *applog.Logger) { s.debugLog = l }
 
+// SetPolicy wires the shared policy (allowlist + blocklist + stats) into the service.
+// Each listener (DoH/DoT/DoQ) is forwarded a reference during Start so every transport
+// makes identical decisions. Must be called before Start. nil disables enforcement.
+func (s *Service) SetPolicy(p *policy.Policy) { s.policy = p }
+
 // Start begins listening on configured endpoints.
 func (s *Service) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -373,6 +380,7 @@ func (s *Service) Start(ctx context.Context) error {
 			return fmt.Errorf("start DoH listener: %w", err)
 		}
 		dohList.ddr = ddr
+		dohList.policy = s.policy
 		s.dohListener = dohList
 		s.wg.Add(1)
 		go func() {
@@ -393,6 +401,7 @@ func (s *Service) Start(ctx context.Context) error {
 			return fmt.Errorf("start DoT listener: %w", err)
 		}
 		dotList.ddr = ddr
+		dotList.policy = s.policy
 		s.dotListener = dotList
 		s.wg.Add(1)
 		go func() {
@@ -409,6 +418,7 @@ func (s *Service) Start(ctx context.Context) error {
 			return fmt.Errorf("start DoQ listener: %w", err)
 		}
 		doqList.ddr = ddr
+		doqList.policy = s.policy
 		// Forward the leveled logger (if wired) so the DoQ listener's benign-idle server-side
 		// lines (client-closed write, idle accept close) log at debug instead of flooding.
 		if s.debugLog != nil {
