@@ -312,7 +312,7 @@ func (v *Validator) authenticatedDNSKEYs(ctx context.Context, zone string, depth
 		// RFC 6840 §5.2 an algorithm/key the validator cannot process makes the zone INSECURE, not
 		// bogus. So we convert the unprocessable-key case to an insecure delegation (answer served
 		// without AD). A genuine bad signature (dns.ErrSig) is NOT unprocessableKey and falls through
-		// as a hard error → BOGUS. See unprocessableKey (nsec3.go) + repos/CLAUDE.md miekg policy.
+		// as a hard error → BOGUS. See unprocessableKey (nsec3.go).
 		if unprocessableKey(err) {
 			return nil, errInsecureDelegation
 		}

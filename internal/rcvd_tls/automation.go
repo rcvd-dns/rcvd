@@ -18,9 +18,9 @@
 //     a server can boot before its certs exist. For a resolver that is wrong — a silent deferral
 //     turns into a hung handshake with no diagnosable error. When pre-issuing (on_demand=false)
 //     rcvd uses ManageSync so a bad ACME/DNS-01 config surfaces at startup, not at first query.
-//   - Logging is rcvd's, not certmagic's. certmagic logs to its own zap sink; under an init
-//     system that sink is lost. rcvd routes certmagic's logger into the rcvd log file so ACME
-//     issuance progress and errors are actually visible. See newZapLogger.
+//   - Logging is rcvd's, not certmagic's. certmagic logs through zap to stderr by default,
+//     which is lost under most init systems. rcvd bridges certmagic's zap logger into the
+//     rcvd log file so ACME issuance progress and errors are actually visible. See newZapLogger.
 //   - Strict ALPN, no HTTP/1.1. The base tls.Config here advertises only "h2"; each Mode-2
 //     listener then pins its own transport ("doq"/"h2"/"h3"). rcvd never falls back to
 //     HTTP/1.1 the way a general web server might. See GetTLSConfig.
@@ -308,14 +308,14 @@ func newNoCleartextDNS01Solver(cfg *AutomationConfig) (*certmagic.DNS01Solver, e
 		DNSManager: certmagic.DNSManager{
 			DNSProvider: provider,
 
-			// Zero-cleartext invariant (a founding principle — see CLAUDE.md "Non-Negotiable
-			// Design Principles" and the whitepaper): rcvd must never emit a cleartext DNS
-			// query. certmagic's default DNS-01 flow includes a propagation self-check that
-			// queries the zone's authoritative nameserver directly over cleartext UDP :53 to
-			// confirm the _acme-challenge TXT is visible before telling the CA to validate.
-			// That probe is a cleartext DNS query originating from rcvd itself. Setting
-			// PropagationTimeout = -1 disables the self-check entirely and unconditionally, so
-			// rcvd never makes that query regardless of how the host is otherwise configured.
+			// Zero-cleartext invariant (a founding principle; see the whitepaper): rcvd must
+			// never emit a cleartext DNS query. certmagic's default DNS-01 flow includes a
+			// propagation self-check that queries the zone's authoritative nameserver directly
+			// over cleartext UDP :53 to confirm the _acme-challenge TXT is visible before
+			// telling the CA to validate. That probe is a cleartext DNS query originating from
+			// rcvd itself. Setting PropagationTimeout = -1 disables the self-check entirely and
+			// unconditionally, so rcvd never makes that query regardless of how the host is
+			// otherwise configured.
 			//
 			// Correctness is unaffected: rcvd still writes the challenge TXT via the provider's
 			// HTTPS API (api.cloudflare.com), and Let's Encrypt performs its own authoritative

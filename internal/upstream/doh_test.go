@@ -471,7 +471,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 }
 
 // TestDOHHandlerOversizedBodyRejected verifies the DoH server rejects an oversized
-// request body (DoS hardening, ISSUES.md 19) AND that it does NOT read more than
+// request body (DoS hardening, HISTORY.md Issue 19) AND that it does NOT read more than
 // dns.MaxMsgSize+1 bytes from the connection — i.e. io.LimitReader bounds the read
 // rather than buffering an unbounded body into memory.
 func TestDOHHandlerOversizedBodyRejected(t *testing.T) {

@@ -178,8 +178,7 @@ func (t *TLSResolver) getConnection(ctx context.Context) (*tls.Conn, error) {
 		// TLS 1.3 only (audit M5), matching the DoQ leg: keeps 1.3's downgrade
 		// resistance and preserves the Go-default X25519MLKEM768 hybrid post-quantum
 		// key exchange (a 1.3-only mechanism — rcvd's harvest-now-decrypt-later
-		// defense). Do NOT set CurvePreferences: that would silently strip MLKEM768
-		// (see repos/CLAUDE.md).
+		// defense). Do NOT set CurvePreferences: that would silently strip MLKEM768.
 		MinVersion: tls.VersionTLS13,
 	}
 	// Apply SPKI pin verification when configured (no-op when t.pin == "").

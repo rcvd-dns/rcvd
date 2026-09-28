@@ -476,7 +476,7 @@ container, the embedded anchor is fine.
 > **Root KSK rollover caveat.** rcvd does **not** yet track root key rollovers automatically
 > (RFC 5011). The embedded anchor is a point-in-time snapshot; if you rely on it, a future
 > root KSK rollover requires an updated rcvd binary. Using `root_key_file` with the system
-> anchor sidesteps this. See the tracked item in `ISSUES.md`.
+> anchor sidesteps this.
 
 **Note:** DNSSEC validation is a security feature. Keep it enabled by default.
 

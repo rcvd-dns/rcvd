@@ -66,8 +66,8 @@ func IsInsecure(err error) bool {
 // §5.2, a validator that cannot process the signing algorithm/key MUST treat the data as INSECURE
 // (unsigned) — NOT bogus. So when the failure is "unprocessable key/algorithm" we convert it to the
 // insecure result (served without AD); only ErrSig-class failures remain bogus. This is rcvd being
-// a production tool where the library is merely a component. See repos/CLAUDE.md (miekg policy) and
-// ISSUES.md 30.
+// a production tool where the library is merely a component. See HISTORY.md (miekg/dns divergence
+// for unprocessable keys).
 func unprocessableKey(err error) bool {
 	return errors.Is(err, dns.ErrKey) ||
 		errors.Is(err, dns.ErrAlg) ||

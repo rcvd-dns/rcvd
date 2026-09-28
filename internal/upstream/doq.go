@@ -341,7 +341,7 @@ func (d *DOQListener) handleStream(ctx context.Context, stream *quic.Stream) {
 	// Neither rejected nor served from cache — go upstream.
 	if response == nil {
 		// Resolve via upstream. UpstreamQueries counted HERE (only queries that go upstream).
-		// Aggregate Success/SERVFAIL/UpstreamErrors — fixes Mode-1-only wiring (ISSUES 4 / 3.4.2).
+		// Aggregate Success/SERVFAIL/UpstreamErrors — fixes Mode-1-only wiring.
 		if d.stats != nil {
 			atomic.AddInt64(&d.stats.UpstreamQueries, 1)
 		}

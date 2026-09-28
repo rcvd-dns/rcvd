@@ -99,7 +99,7 @@ func VerifySelf(ctx context.Context, configPath string, cfg *config.UpstreamConf
 //     (that's a client's job against the public PKI); we are reporting WHAT is being served, and
 //     classifySelfCert() then labels it self-signed vs CA-issued from the chain itself.
 //   - ALPN is set to what each Mode-2 listener requires: rcvd's DoH server STRICTLY requires
-//     "h2" (ISSUES 26 hard-close) and will fail the handshake otherwise; DoQ uses "doq"
+//     "h2" (HISTORY.md Issue 26 hard-close) and will fail the handshake otherwise; DoQ uses "doq"
 //     (RFC 9250); DoT needs no specific ALPN.
 func probeSelf(ctx context.Context, protocol, serverName, dialHost string, port int) (*UpstreamResult, error) {
 	addr := net.JoinHostPort(dialHost, fmt.Sprintf("%d", port))

@@ -20,19 +20,14 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// HTTPResolver handles DNS-over-HTTPS (DoH) queries per RFC 8484.
-// Key RFC 8484 points:
-// - POST request to /dns-query endpoint (or configurable path)
-// - Content-Type: application/dns-message
-// - Accept: application/dns-message
-// - Response: application/dns-message (binary DNS message)
+// HTTPResolver sends DNS-over-HTTPS (RFC 8484) queries as POST requests with
+// Content-Type and Accept set to application/dns-message. rcvd never uses GET,
+// which would put the query in the URL.
 //
-// TRANSPORT NOTE — the underlying HTTP version is selectable:
-//   - HTTP/2 over TCP   (default): classic DoH. Uses the stdlib http.Transport.
-//   - HTTP/3 over QUIC  ("DoH3"):  uses the quic-go http3.Transport (RoundTripper).
-//
-// The request/response logic in Resolve() is identical for both; only the
-// http.RoundTripper held by `client.Transport` differs.
+// The HTTP version is selectable; Resolve() is identical for both, only the
+// http.RoundTripper differs. HTTP/1.1 is never offered:
+//   - HTTP/2 over TCP (default, "DoH2"): stdlib http.Transport, ALPN "h2" only.
+//   - HTTP/3 over QUIC ("DoH3"): quic-go http3.Transport.
 type HTTPResolver struct {
 	endpoint string // e.g., "https://dns.quad9.net:443/dns-query"
 	client   *http.Client
@@ -68,8 +63,7 @@ func NewHTTPResolver(host, dialHost string, port int, path string, useH3 bool, p
 		// TLS 1.3 only (audit M5), matching the DoQ leg: keeps 1.3's downgrade
 		// resistance and preserves the Go-default X25519MLKEM768 hybrid post-quantum
 		// key exchange (a 1.3-only mechanism — rcvd's harvest-now-decrypt-later
-		// defense). Do NOT set CurvePreferences: that would silently strip MLKEM768
-		// (see repos/CLAUDE.md).
+		// defense). Do NOT set CurvePreferences: that would silently strip MLKEM768.
 		MinVersion: tls.VersionTLS13,
 	}
 	// Apply SPKI pin verification when configured (no-op when pin == ""). Shared by
@@ -106,14 +100,14 @@ func NewHTTPResolver(host, dialHost string, port int, path string, useH3 bool, p
 		// DialContext overrides the dial target to the pinned IP while TLS SNI
 		// stays the hostname.
 		//
-		// STRICT HTTP/2 (mirrors the DoH SERVER's h2-only posture, ISSUES 26/32).
+		// STRICT HTTP/2 (mirrors the DoH SERVER's h2-only posture, HISTORY.md Issues 26/32).
 		// Go's http.Transport only auto-negotiates HTTP/2 when it dials the TLS
 		// connection ITSELF; the moment a custom DialContext is set (as here, to reach
 		// the pinned IP) the stdlib DISABLES its implicit h2 wiring and the transport
 		// silently speaks HTTP/1.1. Against an HTTP/2-only upstream (e.g. Mullvad,
 		// Quad9) that means every request fails: the server answers with an h2 SETTINGS
 		// frame, which the h1 client parser reads as a "malformed HTTP response"
-		// (\x00\x00\x06\x04… = length 6, type 0x04 SETTINGS). rcvd does NOT do cleartext
+		// (\x00\x00\x06\x04… = length 6, type 0x04 SETTINGS). rcvd does NOT do
 		// HTTP/1.1 DoH, so we force h2 two ways: advertise ONLY "h2" in ALPN (no
 		// http/1.1 offer, so a mismatch fails the TLS handshake instead of downgrading),
 		// and ConfigureTransport to attach the h2 protocol handler despite the custom dial.

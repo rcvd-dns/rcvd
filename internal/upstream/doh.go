@@ -28,9 +28,8 @@ import (
 // TRANSPORT NOTE — this listener can serve DoH over BOTH HTTP transports:
 //   - HTTP/2 over TCP (the baseline): the classic DoH transport, per RFC 8484 §5.2
 //     which recommends HTTP/2 as the minimum. Handled by the stdlib net/http.Server
-//     in the `h2server` field. (Incidentally, because we don't disable the stdlib's
-//     default ALPN set, an HTTP/1.1-only client would still be accepted via fallback;
-//     this is not a targeted transport — see the HTTP/1.1 audit item in TODO.md.)
+//     in the `h2server` field. HTTP/1.1 is rejected at the TLS handshake (see
+//     NewDOHListener).
 //   - HTTP/3 over QUIC (optional, "DoH3"): DoH carried on HTTP/3, which runs on
 //     QUIC/UDP. Handled by the quic-go http3.Server in the `h3server` field.
 //
@@ -100,7 +99,7 @@ func NewDOHListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 	// without this every client ALPN-negotiated nothing and silently fell back to
 	// HTTP/1.1 (the "HTTP/2 over TCP" listener was really serving h1.1). We clone the
 	// shared config (NOT mutate it) because the h3server shares it and QUIC needs its
-	// own "h3" ALPN, which quic-go sets internally. See ISSUES 26.
+	// own "h3" ALPN, which quic-go sets internally. See HISTORY.md Issue 26.
 	d.h2TLSConfig = tlsConfig.Clone()
 
 	d.h2server = &http.Server{
@@ -127,7 +126,7 @@ func NewDOHListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 	// / attack surface). To genuinely reject it we install GetConfigForClient and fail the
 	// handshake when the client's ALPN offer does not include "h2". An h1.1-only client now
 	// gets a TLS handshake error and never reaches the DoH handler — only h2 (this listener)
-	// and h3 (the QUIC listener) are reachable, and both are tested. See ISSUES 26.
+	// and h3 (the QUIC listener) are reachable, and both are tested. See HISTORY.md Issue 26.
 	enforced := d.h2TLSConfig
 	enforced.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 		// Empty SupportedProtos means the client sent no ALPN extension at all — reject
@@ -295,8 +294,7 @@ func (d *DOHListener) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve query via upstream resolver. UpstreamQueries is counted HERE (not at
 	// ingress) because it must only count queries that actually go upstream — cache
-	// hits above already returned. Aggregate counters fix the Mode-1-only wiring
-	// (see ISSUES 4 / PLAN.md 3.4.2).
+	// hits above already returned. Aggregate counters fix the Mode-1-only wiring.
 	if d.stats != nil {
 		atomic.AddInt64(&d.stats.UpstreamQueries, 1)
 	}
