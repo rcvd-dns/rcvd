@@ -1,4 +1,4 @@
-# CI — fast pre-merge gate. Runs on PRs targeting main and on direct pushes to main.
+# CI — fast pre-merge gate. Runs on every branch push and on PRs targeting main.
 #
 # SCOPE: Linux only, on purpose. rcvd is pure Go (CGO_ENABLED=0), so the darwin/BSD
 # release binaries are CROSS-COMPILED and need no per-OS runner to prove correctness —
@@ -13,10 +13,18 @@
 name: ci
 
 on:
+  # Any branch push (main, fix/*, feat/*, ...) runs the gate, so a branch is checked
+  # before a PR exists. Tag pushes are excluded because `branches` is set; release.yml
+  # owns tags. pull_request stays for PRs from forks, which never push to this repo.
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: ["**"]
+
+# A newer push to the same branch cancels the older, still-running run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
