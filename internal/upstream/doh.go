@@ -18,6 +18,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/rcvd-dns/rcvd/internal/cache"
+	"github.com/rcvd-dns/rcvd/internal/policy"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
 	"golang.org/x/net/http2"
@@ -53,7 +54,8 @@ type DOHListener struct {
 	enableH3  bool          // whether to also serve DoH3 (HTTP/3 over QUIC/UDP)
 	closeOnce sync.Once     // guards Close (idempotent without racing Serve's field reads)
 
-	ddr ddrZone // RFC 9462 resolver.arpa zone: designations + §6.4 containment
+	ddr    ddrZone        // RFC 9462 resolver.arpa zone: designations + §6.4 containment
+	policy *policy.Policy // shared with Mode 1: allowlist+blocklist. nil = enforcement off.
 }
 
 // NewDOHListener creates a new DoH listener.
@@ -151,6 +153,10 @@ func NewDOHListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 
 	return d, nil
 }
+
+// SetPolicy wires the shared policy (allowlist + blocklist + stats) into the listener.
+// Must be called before Serve. nil disables enforcement.
+func (d *DOHListener) SetPolicy(p *policy.Policy) { d.policy = p }
 
 // withAltSvc wraps an HTTP/2 handler so its responses carry an Alt-Svc header
 // advertising the HTTP/3 (DoH3) endpoint on the same authority/port. Clients
@@ -269,6 +275,16 @@ func (d *DOHListener) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 	// rcvd's designations, everything else in the zone gets NODATA. Never forwarded upstream
 	// (§6.4) and never cached, since the answer describes this instance.
 	if resp := d.ddr.answer(query); resp != nil {
+		d.writeResponse(w, resp, servedStart)
+		return
+	}
+
+	// Policy (shared with Mode 1): the same allowlist+blocklist decision DoH/DoT/DoQ
+	// must enforce in lockstep. Denied (allowlist) → REFUSED + EDE 18; blocked → NXDOMAIN.
+	// Runs BEFORE the cache so a denied qname is never served from a positive answer and
+	// never reaches the upstream leg.
+	if resp := d.policy.Response(query); resp != nil {
+		ensureResponseEDNS(resp, query)
 		d.writeResponse(w, resp, servedStart)
 		return
 	}

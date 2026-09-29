@@ -7,11 +7,14 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/rcvd-dns/rcvd/internal/allowlist"
 	"github.com/rcvd-dns/rcvd/internal/blocklist"
 	"github.com/rcvd-dns/rcvd/internal/cache"
 	"github.com/rcvd-dns/rcvd/internal/config"
@@ -1109,5 +1112,597 @@ func TestEnsureResponseEDNSStripsDNSSECForNonDOClient(t *testing.T) {
 	}
 	if got := countRR(nonEDNS, dns.TypeA); got != 1 {
 		t.Errorf("non-EDNS query: expected 1 A record retained, got %d", got)
+	}
+}
+
+// TestPolicyResponseUDPAndTCPIdentical exercises the shared policy check end-to-end:
+// a query policy decision (the blocklist today) must yield byte-identical replies over
+// UDP and TCP, count exactly once in BlockedQueries per reply, and NEVER reach the
+// upstream resolver. Allowed names must pass through to the resolver.
+//
+// Reuses TestServerBlocklistIntegration helpers — same MockResolver + discard-log pattern,
+// same NewServer shape, real bind (port 0) so both UDP and TCP loops run their actual code.
+func TestPolicyResponseUDPAndTCPIdentical(t *testing.T) {
+	cfg := &config.Config{
+		Resolver:   config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"},
+		Cache:      config.CacheConfig{Enabled: false},
+		Blocklists: config.BlocklistConfig{Enabled: true},
+	}
+
+	mockResolver := &MockResolver{
+		response: &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+			Question: []dns.Question{{Name: "allowed.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+			Answer: []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: "allowed.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.IPv4(93, 184, 216, 34),
+			}},
+		},
+	}
+
+	dnsBlocklist := blocklist.New(true)
+	dnsBlocklist.Add("blocked.example.com")
+
+	stats := statistics.New()
+	discardLog := log.New(io.Discard, "", 0)
+	srv := NewServer(cfg, mockResolver,
+		cache.New(cache.Options{Enabled: false, MaxSize: 0, TTLMin: 0, TTLMax: 0}),
+		dnsBlocklist, nil, stats, discardLog)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Stop(time.Second)
+	time.Sleep(10 * time.Millisecond)
+
+	udpAddr := srv.UDPAddr().String()
+	tcpAddr := srv.TCPAddr().String()
+
+	// Helper: send one query, return the response. Network="udp" or "tcp".
+	send := func(t *testing.T, network, addr, name string) *dns.Msg {
+		t.Helper()
+		c := new(dns.Client)
+		c.Net = network
+		m := new(dns.Msg)
+		m.SetQuestion(name, dns.TypeA)
+		resp, _, err := c.Exchange(m, addr)
+		if err != nil {
+			t.Fatalf("%s exchange for %s failed: %v", network, name, err)
+		}
+		return resp
+	}
+
+	// 1. The blocked name must yield NXDOMAIN over BOTH transports, with the question
+	// echoed, identical Rcode / MsgHdr flags / OPT presence. policyResponse is the
+	// single decision point — these replies come from the same function.
+	blockedUDP := send(t, "udp", udpAddr, "blocked.example.com.")
+	blockedTCP := send(t, "tcp", tcpAddr, "blocked.example.com.")
+
+	if blockedUDP.Rcode != dns.RcodeNameError {
+		t.Errorf("UDP blocked: expected NXDOMAIN, got rcode %d", blockedUDP.Rcode)
+	}
+	if blockedTCP.Rcode != dns.RcodeNameError {
+		t.Errorf("TCP blocked: expected NXDOMAIN, got rcode %d", blockedTCP.Rcode)
+	}
+	if !blockedUDP.Response || !blockedTCP.Response {
+		t.Errorf("both replies must set Response=true (udp=%v tcp=%v)", blockedUDP.Response, blockedTCP.Response)
+	}
+	if len(blockedUDP.Question) != 1 || len(blockedTCP.Question) != 1 ||
+		blockedUDP.Question[0].Name != "blocked.example.com." ||
+		blockedTCP.Question[0].Name != "blocked.example.com." {
+		t.Errorf("both replies must echo the question (udp=%v tcp=%v)", blockedUDP.Question, blockedTCP.Question)
+	}
+	// OPT presence must match across transports — the EDNS echo in the policy tail is
+	// a load-bearing detail for Issue 28.
+	if (blockedUDP.IsEdns0() == nil) != (blockedTCP.IsEdns0() == nil) {
+		t.Errorf("OPT presence must match across transports (udp OPT=%v tcp OPT=%v)",
+			blockedUDP.IsEdns0() != nil, blockedTCP.IsEdns0() != nil)
+	}
+	// Rcode equality is already checked; assert MsgHdr byte-shape parity for everything
+	// the seam owns (Response, Opcode, Authoritative, Truncated, RecursionDesired,
+	// RecursionAvailable, Zero — Rcode already verified above).
+	if blockedUDP.MsgHdr.Response != blockedTCP.MsgHdr.Response ||
+		blockedUDP.MsgHdr.Opcode != blockedTCP.MsgHdr.Opcode ||
+		blockedUDP.MsgHdr.Authoritative != blockedTCP.MsgHdr.Authoritative ||
+		blockedUDP.MsgHdr.Truncated != blockedTCP.MsgHdr.Truncated ||
+		blockedUDP.MsgHdr.RecursionDesired != blockedTCP.MsgHdr.RecursionDesired ||
+		blockedUDP.MsgHdr.RecursionAvailable != blockedTCP.MsgHdr.RecursionAvailable ||
+		blockedUDP.MsgHdr.Zero != blockedTCP.MsgHdr.Zero {
+		t.Errorf("MsgHdr flags must be identical across transports (udp=%+v tcp=%+v)",
+			blockedUDP.MsgHdr, blockedTCP.MsgHdr)
+	}
+
+	// 2. BlockedQueries must increment by exactly one per reply, totaling 2 (Issue 27).
+	if stats.BlockedQueries != 2 {
+		t.Errorf("BlockedQueries: expected 2 (one UDP + one TCP block), got %d", stats.BlockedQueries)
+	}
+
+	// 3. The mock resolver must have seen ZERO calls for the blocked name. The blocklist
+	// path answers locally — never forwards.
+	if n := mockResolver.CallCount(); n != 0 {
+		t.Errorf("blocked query reached the upstream resolver (%d calls)", n)
+	}
+
+	// 4. An allowed name must reach the resolver on both transports (sanity: the policy
+	// seam is "deny-only"; it must not regress the cache-miss → upstream path).
+	allowedUDP := send(t, "udp", udpAddr, "allowed.example.com.")
+	if allowedUDP.Rcode != dns.RcodeSuccess {
+		t.Errorf("UDP allowed: expected NOERROR, got rcode %d", allowedUDP.Rcode)
+	}
+	allowedTCP := send(t, "tcp", tcpAddr, "allowed.example.com.")
+	if allowedTCP.Rcode != dns.RcodeSuccess {
+		t.Errorf("TCP allowed: expected NOERROR, got rcode %d", allowedTCP.Rcode)
+	}
+	if n := mockResolver.CallCount(); n != 2 {
+		t.Errorf("allowed name: expected 2 upstream calls (one per transport), got %d", n)
+	}
+	// The blocked counter must not have moved on the allowed queries.
+	if stats.BlockedQueries != 2 {
+		t.Errorf("BlockedQueries drifted on allowed queries: expected 2, got %d", stats.BlockedQueries)
+	}
+}
+
+// TestAllowlistDenyRefusedNotForwarded is the headline test for the default-deny
+// feature: a name NOT under a listed suffix must be REFUSED locally, never
+// forwarded, never cached. EDE 18 (Prohibited) is attached to the OPT when
+// the client used EDNS, and absent OPT for non-EDNS clients (RFC 6891 §6.1.1).
+// Counted in DeniedQueries — NOT in BlockedQueries. Blocked stays for the
+// existing blocklist NXDOMAIN counter.
+func TestAllowlistDenyRefusedNotForwarded(t *testing.T) {
+	cfg := &config.Config{
+		Resolver:   config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"},
+		Cache:      config.CacheConfig{Enabled: true, MaxSize: 100, TTLMin: 60, TTLMax: 3600},
+		Blocklists: config.BlocklistConfig{Enabled: false},
+	}
+
+	mockResolver := &MockResolver{
+		response: &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+			Question: []dns.Question{{Name: "www.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+			Answer: []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: "www.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.IPv4(93, 184, 216, 34),
+			}},
+		},
+	}
+
+	al := seededAllowlist(t, "example.com\n")
+
+	stats := statistics.New()
+	discardLog := log.New(io.Discard, "", 0)
+	srv := NewServer(cfg, mockResolver,
+		cache.New(cache.Options{Enabled: true, MaxSize: 100, TTLMin: 60, TTLMax: 3600}),
+		blocklist.New(false), nil, stats, discardLog)
+	srv.SetAllowlist(al)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Stop(time.Second)
+	time.Sleep(10 * time.Millisecond)
+
+	udpAddr := srv.UDPAddr().String()
+	tcpAddr := srv.TCPAddr().String()
+
+	// Build a denied qname: NOT under example.com. The attack shape was
+	// "_acme-challenge.<ip>.nip.io" — a synthetic subdomain under an unrelated
+	// parent. We use leak.attacker.example.net to keep the suffix non-empty and
+	// not accidentally collide with anything in the allowlist.
+	denied := "leak.attacker.example.net."
+
+	// 1. UDP denied: REFUSED + EDE 18 when the query carried OPT; mock resolver
+	// must NOT be hit.
+	udpDO := new(dns.Msg)
+	udpDO.SetQuestion(denied, dns.TypeA)
+	udpDO.SetEdns0(4096, false)
+	udpClient := new(dns.Client)
+	udpClient.Net = "udp"
+	udpResp, _, err := udpClient.Exchange(udpDO.Copy(), udpAddr)
+	if err != nil {
+		t.Fatalf("UDP exchange: %v", err)
+	}
+	if udpResp.Rcode != dns.RcodeRefused {
+		t.Errorf("UDP denied: expected REFUSED, got rcode %d", udpResp.Rcode)
+	}
+	if !udpResp.Response {
+		t.Error("UDP denied: Response bit must be set")
+	}
+	if got := len(udpResp.Question); got != 1 || udpResp.Question[0].Name != denied {
+		t.Errorf("UDP denied: question must be echoed, got %+v", udpResp.Question)
+	}
+	opt := udpResp.IsEdns0()
+	if opt == nil {
+		t.Fatal("UDP denied (DO-bit query): response must carry OPT for EDE attachment")
+	}
+	ede := findEDE(opt)
+	if ede == nil {
+		t.Fatal("UDP denied (DO-bit query): response OPT must carry an EDE option")
+	}
+	if ede.InfoCode != dns.ExtendedErrorCodeProhibited {
+		t.Errorf("EDE InfoCode: expected %d (Prohibited), got %d", dns.ExtendedErrorCodeProhibited, ede.InfoCode)
+	}
+
+	// 2. UDP denied (NON-EDNS): REFUSED, NO OPT (RFC 6891 §6.1.1, Issue 36).
+	udpNoEdns := new(dns.Msg)
+	udpNoEdns.SetQuestion(denied, dns.TypeA)
+	udpNoEdnsResp, _, err := udpClient.Exchange(udpNoEdns.Copy(), udpAddr)
+	if err != nil {
+		t.Fatalf("UDP non-EDNS exchange: %v", err)
+	}
+	if udpNoEdnsResp.Rcode != dns.RcodeRefused {
+		t.Errorf("UDP non-EDNS denied: expected REFUSED, got rcode %d", udpNoEdnsResp.Rcode)
+	}
+	if opt := udpNoEdnsResp.IsEdns0(); opt != nil {
+		t.Error("UDP non-EDNS denied: response must NOT carry OPT (RFC 6891 §6.1.1, Issue 36)")
+	}
+
+	// 3. TCP denied: REFUSED too, with the same shape.
+	tcpClient := new(dns.Client)
+	tcpClient.Net = "tcp"
+	tcpMsg := new(dns.Msg)
+	tcpMsg.SetQuestion(denied, dns.TypeA)
+	tcpResp, _, err := tcpClient.Exchange(tcpMsg.Copy(), tcpAddr)
+	if err != nil {
+		t.Fatalf("TCP exchange: %v", err)
+	}
+	if tcpResp.Rcode != dns.RcodeRefused {
+		t.Errorf("TCP denied: expected REFUSED, got rcode %d", tcpResp.Rcode)
+	}
+	if !tcpResp.Response {
+		t.Error("TCP denied: Response bit must be set")
+	}
+
+	// 4. Counters: three denials (UDP DO-bit + UDP non-EDNS + TCP), zero blocks,
+	// zero upstream calls.
+	snap := stats.TakeSnapshot(0, 0, statistics.InstanceInfo{})
+	if snap.DeniedQueries != 3 {
+		t.Errorf("DeniedQueries: expected 3 (UDP DO + UDP non-EDNS + TCP), got %d", snap.DeniedQueries)
+	}
+	if snap.BlockedQueries != 0 {
+		t.Errorf("BlockedQueries must NOT increment for allowlist denials: got %d", snap.BlockedQueries)
+	}
+	if n := mockResolver.CallCount(); n != 0 {
+		t.Errorf("denied query reached the upstream resolver (%d calls) — qname must NEVER leave the host", n)
+	}
+
+	// 5. Cache must contain nothing for the denied name — deny happens BEFORE cache
+	// (cache MUST not serve a denied name from a previous lookup).
+	// The DENIAL counter (DeniedQueries == 2) and zero upstream calls together
+	// prove the no-forward path: the policyResponse short-circuits before the
+	// cache lookup runs. A direct cache lookup on the live cache confirms it
+	// is empty for the denied name.
+	if _, hit := srv.cache.Get(makeQuery(denied, dns.TypeA)); hit {
+		t.Error("denied name must not appear in the cache")
+	}
+}
+
+// makeQuery builds a one-question dns.Msg for the (name, qtype) pair, used to
+// poke the cache directly in the deny test without going through the wire.
+func makeQuery(name string, qtype uint16) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetQuestion(name, qtype)
+	return m
+}
+
+// TestAllowlistAllowsListedSuffix covers the negative case of the headline
+// test: a name under a listed suffix MUST reach the upstream resolver (and
+// the cache). The allowlist must not break the normal happy path.
+func TestAllowlistAllowsListedSuffix(t *testing.T) {
+	cfg := &config.Config{
+		Resolver:   config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"},
+		Cache:      config.CacheConfig{Enabled: false},
+		Blocklists: config.BlocklistConfig{Enabled: false},
+	}
+
+	mockResolver := &MockResolver{
+		response: &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+			Question: []dns.Question{{Name: "www.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+			Answer: []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: "www.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.IPv4(93, 184, 216, 34),
+			}},
+		},
+	}
+
+	al := seededAllowlist(t, "example.com\n")
+	stats := statistics.New()
+	discardLog := log.New(io.Discard, "", 0)
+	srv := NewServer(cfg, mockResolver,
+		cache.New(cache.Options{Enabled: false}),
+		blocklist.New(false), nil, stats, discardLog)
+	srv.SetAllowlist(al)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Stop(time.Second)
+	time.Sleep(10 * time.Millisecond)
+
+	resp := sendUDPQuery(t, srv.UDPAddr().String(), "www.example.com.", dns.TypeA)
+	if resp.Rcode != dns.RcodeSuccess {
+		t.Errorf("allowed subdomain: expected NOERROR, got rcode %d", resp.Rcode)
+	}
+	if n := mockResolver.CallCount(); n != 1 {
+		t.Errorf("allowed name: expected 1 upstream call, got %d", n)
+	}
+	snap := stats.TakeSnapshot(0, 0, statistics.InstanceInfo{})
+	if snap.DeniedQueries != 0 {
+		t.Errorf("allowed query must not increment DeniedQueries: got %d", snap.DeniedQueries)
+	}
+}
+
+// TestAllowlistBlockWinsInsideAllowedSuffix verifies the settled policy: an
+// entry listed on the allowlist AND the blocklist gets the blocklist's NXDOMAIN,
+// not a refused. Block wins. BlockedQueries increments; DeniedQueries does not.
+func TestAllowlistBlockWins(t *testing.T) {
+	cfg := &config.Config{
+		Resolver:   config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"},
+		Cache:      config.CacheConfig{Enabled: false},
+		Blocklists: config.BlocklistConfig{Enabled: true},
+	}
+
+	mockResolver := &MockResolver{
+		response: &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess}},
+	}
+
+	al := seededAllowlist(t, "example.com\n") // allowlist covers the whole example.com tree
+	bl := blocklist.New(true)
+	bl.Add("ads.example.com") // blocklist narrows it down to one subdomain
+
+	stats := statistics.New()
+	discardLog := log.New(io.Discard, "", 0)
+	srv := NewServer(cfg, mockResolver,
+		cache.New(cache.Options{Enabled: false}),
+		bl, nil, stats, discardLog)
+	srv.SetAllowlist(al)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Stop(time.Second)
+	time.Sleep(10 * time.Millisecond)
+
+	resp := sendUDPQuery(t, srv.UDPAddr().String(), "ads.example.com.", dns.TypeA)
+	if resp.Rcode != dns.RcodeNameError {
+		t.Errorf("blocked-inside-allow: expected NXDOMAIN (block wins), got rcode %d", resp.Rcode)
+	}
+	snap := stats.TakeSnapshot(0, 0, statistics.InstanceInfo{})
+	if snap.BlockedQueries != 1 {
+		t.Errorf("BlockedQueries: expected 1 (block wins), got %d", snap.BlockedQueries)
+	}
+	if snap.DeniedQueries != 0 {
+		t.Errorf("DeniedQueries must not increment when block fires inside an allowed suffix: got %d", snap.DeniedQueries)
+	}
+	if n := mockResolver.CallCount(); n != 0 {
+		t.Errorf("blocked name reached upstream (%d calls) — blocklist path must not forward", n)
+	}
+}
+
+// TestAllowlistNilIsOff verifies the off switch: a server constructed without a
+// Policy wired (or with nil SetPolicy / SetAllowlist(nil)) ignores the feature
+// entirely. Pre-feature configs and callers that haven't wired a policy must
+// behave exactly as they did before the feature landed.
+func TestAllowlistNilIsOff(t *testing.T) {
+	cfg := &config.Config{
+		Resolver:   config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"},
+		Cache:      config.CacheConfig{Enabled: false},
+		Blocklists: config.BlocklistConfig{Enabled: false},
+	}
+	mockResolver := &MockResolver{
+		response: &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+			Question: []dns.Question{{Name: "anything.test.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}},
+	}
+	stats := statistics.New()
+	discardLog := log.New(io.Discard, "", 0)
+	srv := NewServer(cfg, mockResolver,
+		cache.New(cache.Options{Enabled: false}),
+		blocklist.New(false), nil, stats, discardLog)
+	// Explicitly NOT calling SetAllowlist; also call it with nil to prove
+	// the setter is idempotent + safe at any time before Start.
+	srv.SetAllowlist(nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Stop(time.Second)
+	time.Sleep(10 * time.Millisecond)
+
+	resp := sendUDPQuery(t, srv.UDPAddr().String(), "anything.test.", dns.TypeA)
+	if resp.Rcode != dns.RcodeSuccess {
+		t.Errorf("nil allowlist: expected NOERROR (feature off), got rcode %d", resp.Rcode)
+	}
+	if n := mockResolver.CallCount(); n != 1 {
+		t.Errorf("nil allowlist: expected 1 upstream call, got %d", n)
+	}
+	snap := stats.TakeSnapshot(0, 0, statistics.InstanceInfo{})
+	if snap.DeniedQueries != 0 {
+		t.Errorf("nil allowlist: DeniedQueries must remain 0, got %d", snap.DeniedQueries)
+	}
+}
+
+// findEDE walks an OPT record's Option slice and returns the EDE option if present.
+func findEDE(opt *dns.OPT) *dns.EDNS0_EDE {
+	for _, o := range opt.Option {
+		if ede, ok := o.(*dns.EDNS0_EDE); ok {
+			return ede
+		}
+	}
+	return nil
+}
+
+// seededAllowlist builds an *allowlist.Allowlist from a body string, writing
+// to a temp file under the hood. Used by tests that need an allowlist seeded
+// with specific entries without dragging temp-file management into each test.
+func seededAllowlist(t *testing.T, body string) *allowlist.Allowlist {
+	t.Helper()
+	dir := t.TempDir()
+	path := dir + "/allow.txt"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatalf("write allow file: %v", err)
+	}
+	al := allowlist.New()
+	if err := al.LoadFiles([]string{path}); err != nil {
+		t.Fatalf("load allowlist: %v", err)
+	}
+	return al
+}
+
+// TestAllowlistReloadPolicyBeforeCache is the integration test for the
+// --allowlist-reload hot path: a name that was allowed (and therefore cached)
+// must be REFUSED the moment it is removed from the live set, even when the
+// cache still holds the prior NOERROR answer. Policy runs before cache on
+// every listener, so a removed entry can never be served
+// from cache. The test exercises this end-to-end through the real server
+// and a real cache: resolve, cache, remove the file entry, reload (which
+// atomically swaps the live set on the SAME Allowlist instance the policy
+// holds), re-query, assert REFUSED + zero new upstream calls.
+func TestAllowlistReloadPolicyBeforeCache(t *testing.T) {
+	cfg := &config.Config{
+		Resolver:   config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"},
+		Cache:      config.CacheConfig{Enabled: true, MaxSize: 100, TTLMin: 60, TTLMax: 3600},
+		Blocklists: config.BlocklistConfig{Enabled: false},
+	}
+
+	mockResolver := &MockResolver{
+		response: &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+			Question: []dns.Question{{Name: "sub.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+			Answer: []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: "sub.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   net.IPv4(93, 184, 216, 34),
+			}},
+		},
+	}
+
+	dir := t.TempDir()
+	allowPath := dir + "/allow.txt"
+	if err := os.WriteFile(allowPath, []byte("example.com\n"), 0644); err != nil {
+		t.Fatalf("write allow file: %v", err)
+	}
+	al := allowlist.New()
+	if err := al.LoadFiles([]string{allowPath}); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	stats := statistics.New()
+	discardLog := log.New(io.Discard, "", 0)
+	srv := NewServer(cfg, mockResolver,
+		cache.New(cache.Options{Enabled: true, MaxSize: 100, TTLMin: 60, TTLMax: 3600}),
+		blocklist.New(false), nil, stats, discardLog)
+	srv.SetAllowlist(al)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Stop(time.Second)
+	time.Sleep(10 * time.Millisecond)
+
+	udpAddr := srv.UDPAddr().String()
+
+	// 1. First query: allowed, NOERROR, upstream called once and the answer
+	// lands in the cache.
+	resp := sendUDPQuery(t, udpAddr, "sub.example.com.", dns.TypeA)
+	if resp.Rcode != dns.RcodeSuccess {
+		t.Fatalf("initial allowed query: expected NOERROR, got rcode %d", resp.Rcode)
+	}
+	if n := mockResolver.CallCount(); n != 1 {
+		t.Fatalf("initial allowed query: expected 1 upstream call, got %d", n)
+	}
+	cachedBefore, hit := srv.cache.Get(makeQuery("sub.example.com.", dns.TypeA))
+	if !hit || cachedBefore == nil {
+		t.Fatal("after warm-up: cache must hold the allowed answer (cache-miss flow runs before cache.Put)")
+	}
+
+	// 2. Rewrite the allowlist file so the suffix is GONE — and run the same
+	// LoadFiles the daemon's --allowlist-reload callback runs, against the SAME
+	// *allowlist.Allowlist instance the policy holds. This is the reload
+	// behavior under test: atomic swap on the live set, no new instance.
+	if err := os.WriteFile(allowPath, []byte("example.org\n"), 0644); err != nil {
+		t.Fatalf("rewrite allow file: %v", err)
+	}
+	if err := al.LoadFiles([]string{allowPath}); err != nil {
+		t.Fatalf("simulated reload: %v", err)
+	}
+	if al.Size() != 1 || !al.Allowed("example.org") {
+		t.Fatalf("post-reload allowlist state wrong: Size=%d", al.Size())
+	}
+	if al.Allowed("sub.example.com") {
+		t.Fatal("post-reload: sub.example.com must NO LONGER be allowed")
+	}
+
+	// 3. Second query: the cache still holds the previous answer, but the
+	// policy runs first and refuses the name. Mock resolver must see ZERO new
+	// calls (no upstream round-trip for the denied name).
+	after := sendUDPQuery(t, udpAddr, "sub.example.com.", dns.TypeA)
+	if after.Rcode != dns.RcodeRefused {
+		t.Errorf("post-reload query: expected REFUSED (policy-before-cache), got rcode %d", after.Rcode)
+	}
+	if n := mockResolver.CallCount(); n != 1 {
+		t.Errorf("post-reload query: expected NO new upstream calls (1 from initial), got %d total", n)
+	}
+
+	// 4. Counters: 1 denial, no upstream traffic for it.
+	snap := stats.TakeSnapshot(0, 0, statistics.InstanceInfo{})
+	if snap.DeniedQueries != 1 {
+		t.Errorf("DeniedQueries: expected 1, got %d", snap.DeniedQueries)
+	}
+
+	// 5. A different name that is STILL allowed must continue to pass through
+	// (the live set is not empty — example.org is on it now).
+	if !al.Allowed("anything.example.org") {
+		t.Fatal("post-reload: example.org must still be allowed")
+	}
+}
+
+// TestAllowlistReloadFailedLeavesPreviousSetActive guards the fail-closed
+// reload path at the Allowlist level: a failed reload (here, an invalid line
+// introduced after a valid load) must leave the previous entries in the live
+// set untouched. The cache integration is the headline (see
+// TestAllowlistReloadPolicyBeforeCache); this test pins the loader's
+// "previous set intact" invariant independently.
+func TestAllowlistReloadFailedLeavesPreviousSetActive(t *testing.T) {
+	dir := t.TempDir()
+	allowPath := dir + "/allow.txt"
+	if err := os.WriteFile(allowPath, []byte("example.com\nexample.net\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	al := allowlist.New()
+	if err := al.LoadFiles([]string{allowPath}); err != nil {
+		t.Fatalf("seed load: %v", err)
+	}
+	if al.Size() != 2 {
+		t.Fatalf("seed: expected 2 entries, got %d", al.Size())
+	}
+
+	// Break the file. LoadFiles must error, name the failing line, and leave
+	// the previous set intact.
+	if err := os.WriteFile(allowPath, []byte("example.com\n-bad-.com\n"), 0644); err != nil {
+		t.Fatalf("break: %v", err)
+	}
+	err := al.LoadFiles([]string{allowPath})
+	if err == nil {
+		t.Fatal("expected reload error on invalid line, got nil")
+	}
+	if !strings.Contains(err.Error(), "allow.txt:2") {
+		t.Errorf("error must name the failing file:line, got: %v", err)
+	}
+	if al.Size() != 2 {
+		t.Errorf("previous set must survive a failed reload; got Size=%d, want 2", al.Size())
+	}
+	if !al.Allowed("example.com") || !al.Allowed("example.net") {
+		t.Error("previous entries must still be allowed after a failed reload")
 	}
 }

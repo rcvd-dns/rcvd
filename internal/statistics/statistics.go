@@ -29,6 +29,13 @@ type Stats struct {
 	BlockedQueries       int64
 	BlocklistFilesLoaded int64 // number of blocklist files successfully loaded (0 = none/loading)
 
+	// Allowlist (default-deny)
+	//
+	// A denied qname is the sensitive payload (the original incident used the
+	// qname itself as the exfil channel). The qname is never logged at default
+	// verbosity; only the count is observable.
+	DeniedQueries int64
+
 	// Responses — exactly ONE bucket is incremented per response sent to a client,
 	// keyed on the response rcode (see RecordResponse). Their sum equals TotalQueries
 	// minus the rare responses dropped by a local pack/write error before send. This
@@ -88,11 +95,12 @@ type Stats struct {
 // WHICH rcvd instance + config this stats output belongs to — important when multiple
 // instances run on one host. Injected at snapshot time, like cache info.
 type InstanceInfo struct {
-	ConfigPath   string // absolute path of the loaded config file
-	SocketPath   string // this instance's stats socket path
-	Mode1Enabled   bool // [resolver] enabled — Mode 1 (forwarding resolver)
-	Mode2Enabled   bool // [upstream_service] enabled — Mode 2 (client-facing server)
-	DNSSECEnabled  bool // [dnssec] enabled
+	ConfigPath       string // absolute path of the loaded config file
+	SocketPath       string // this instance's stats socket path
+	Mode1Enabled     bool   // [resolver] enabled — Mode 1 (forwarding resolver)
+	Mode2Enabled     bool   // [upstream_service] enabled — Mode 2 (client-facing server)
+	DNSSECEnabled    bool   // [dnssec] enabled
+	AllowlistEnabled bool   // [allowlist] enabled — default-deny name filter is on
 
 	// Cache posture (operator-facing): the configured mode name plus the capabilities it
 	// actually enabled, read from the live cache (so the descriptor can't drift from
@@ -111,6 +119,7 @@ type Snapshot struct {
 	CacheMisses          int64
 	StaleServed          int64
 	BlockedQueries       int64
+	DeniedQueries        int64
 	BlocklistFilesLoaded int64
 	ServfailResponses    int64
 	NxdomainResponses    int64
@@ -278,6 +287,7 @@ func (s *Stats) TakeSnapshot(cacheSize, cacheMaxSize int, info InstanceInfo) Sna
 		CacheMisses:          atomic.LoadInt64(&s.CacheMisses),
 		StaleServed:          atomic.LoadInt64(&s.StaleServed),
 		BlockedQueries:       atomic.LoadInt64(&s.BlockedQueries),
+		DeniedQueries:        atomic.LoadInt64(&s.DeniedQueries),
 		BlocklistFilesLoaded: atomic.LoadInt64(&s.BlocklistFilesLoaded),
 		ServfailResponses:    atomic.LoadInt64(&s.ServfailResponses),
 		NxdomainResponses:    atomic.LoadInt64(&s.NxdomainResponses),
@@ -508,6 +518,16 @@ func (snap *Snapshot) Render(version string) string {
 		fmt.Fprintf(&b, "    %*s %s\n", w, "Blocklists:", "none loaded")
 	}
 	fmt.Fprintf(&b, "    %*s %s\n", w, "Blocked (NXDOMAIN):", fmtInt(snap.BlockedQueries))
+	// Default-deny allows the BLOCKLIST's NXDOMAIN count to coexist with an
+	// ALLOWLIST count — "blocked" means a name was listed and NXDOMAIN'd,
+	// "denied" means a name was NOT on the allowlist and REFUSED. Show the
+	// allowlist line only when there is something to say (any deny, ever, OR
+	// the feature is configured on) so a passive operator does not see a
+	// permanent zero. Qnames are never logged here — the qname IS the sensitive
+	// payload (used as an exfil channel), only the count is.
+	if snap.DeniedQueries > 0 || snap.Instance.AllowlistEnabled {
+		fmt.Fprintf(&b, "    %*s %s\n", w, "Denied (allowlist):", fmtInt(snap.DeniedQueries))
+	}
 
 	return b.String()
 }

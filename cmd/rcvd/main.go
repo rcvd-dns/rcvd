@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -14,11 +15,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rcvd-dns/rcvd/internal/allowlist"
 	"github.com/rcvd-dns/rcvd/internal/blocklist"
 	"github.com/rcvd-dns/rcvd/internal/cache"
 	"github.com/rcvd-dns/rcvd/internal/config"
 	"github.com/rcvd-dns/rcvd/internal/dnssec"
 	"github.com/rcvd-dns/rcvd/internal/logger"
+	"github.com/rcvd-dns/rcvd/internal/policy"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 	"github.com/rcvd-dns/rcvd/internal/server"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
@@ -31,13 +34,13 @@ import (
 // local build so that even a bare `go build ./cmd/rcvd` self-reports honestly.
 //
 //	version     — release version, normally the git tag (e.g. "0.1.0").
-//	              Default "0.1.0-dev" marks an untagged development build.
+//	              Default "0.3.0-dev" marks an untagged development build.
 //	buildDate   — UTC build timestamp (RFC 3339), e.g. "2026-07-07T10:00:00Z".
 //	buildSource — what produced the binary: "local" (a developer machine),
 //	              "github-runner", "gitlab-runner", etc. Lets anyone inspect an
 //	              artifact and know its provenance.
 var (
-	version     = "0.1.0-dev"
+	version     = "0.3.0-dev"
 	buildDate   = "unknown"
 	buildSource = "local"
 )
@@ -45,6 +48,25 @@ var (
 // displayVersion returns the version with exactly one leading "v".
 func displayVersion() string {
 	return "v" + strings.TrimPrefix(version, "v")
+}
+
+// buildString is the version plus the commit and build date, e.g.
+// "v0.3.0-dev (commit fbdbb37687c7, built 2026-09-28T13:17:34Z)". The running
+// daemon reports it via --stats/--audit, so an operator can tell which build a
+// long-lived process is running even after the binary on disk was replaced.
+// Unknown fields are omitted.
+func buildString() string {
+	var parts []string
+	if rev := vcsRevision(); rev != "unknown" {
+		parts = append(parts, "commit "+rev)
+	}
+	if buildDate != "unknown" {
+		parts = append(parts, "built "+buildDate)
+	}
+	if len(parts) == 0 {
+		return displayVersion()
+	}
+	return displayVersion() + " (" + strings.Join(parts, ", ") + ")"
 }
 
 // vcsRevision returns the git commit the binary was built from, read from the
@@ -85,6 +107,7 @@ func main() {
 	showStats := flag.Bool("stats", false, "query running instance for statistics and exit")
 	showAudit := flag.Bool("audit", false, "query running instance for live posture audit and exit")
 	blocklistReload := flag.Bool("blocklist-reload", false, "trigger an async blocklist file reload in the running instance and exit")
+	allowlistReload := flag.Bool("allowlist-reload", false, "trigger a synchronous allowlist file reload in the running instance and exit (0 on success, 1 on failure)")
 	verifyUpstream := flag.Bool("verify-upstream", false, "verify upstream TLS certificates (CA-validating) and exit")
 	verifyPin := flag.Bool("verify-pin", false, "validate each upstream's configured pinned_pubkey against the live server and exit")
 	showPin := flag.Int("show-pin", -1, "probe upstream at the given 0-based index, print its SPKI pin (sha256//…) to stdout, and exit")
@@ -156,6 +179,23 @@ func main() {
 		}
 		fmt.Print(output)
 		os.Exit(0)
+	}
+
+	if *allowlistReload {
+		socketPath := statistics.SocketPath(*configPath)
+		output, err := statistics.QueryAllowlistReload(socketPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		// Parse the daemon's reply prefix to pick the exit code: success starts
+		// with "allowlist reloaded", everything else is non-zero. The CLI prints
+		// the reply verbatim either way so the operator sees the exact reason.
+		fmt.Print(output)
+		if strings.HasPrefix(output, "allowlist reloaded") {
+			os.Exit(0)
+		}
+		os.Exit(1)
 	}
 
 	if *verifyUpstream {
@@ -325,6 +365,17 @@ func main() {
 		}
 	}
 
+	// Initialize allowlist (default-deny). When enabled, the list is loaded
+	// SYNCHRONOUSLY here, BEFORE any listener starts — a failed load or an
+	// empty result is a hard exit, not a silent gap. The blocklist copies
+	// "load in background, resolve normally during load" because its safe
+	// failure mode (no filter active) is benign; the allowlist's safe failure
+	// mode is the opposite (deny everything until it loads).
+	dnsAllowlist, allowlistErr := loadAllowlistAtStartup(cfg, appLogger)
+	if allowlistErr != nil {
+		os.Exit(1)
+	}
+
 	// Initialize DNSSEC validator
 	dnsValidator := dnssec.New(cfg.DNSSEC.Enabled, cfg.DNSSEC.ValidateAll)
 	if cfg.DNSSEC.Enabled {
@@ -366,11 +417,12 @@ func main() {
 		socketPath := statistics.SocketPath(*configPath)
 		// Static per-instance metadata for the stats header (config/socket/modes).
 		instInfo := statistics.InstanceInfo{
-			ConfigPath:    absConfig,
-			SocketPath:    socketPath,
-			Mode1Enabled:  cfg.Resolver.Enabled,
-			Mode2Enabled:  cfg.UpstreamService.Enabled,
-			DNSSECEnabled: cfg.DNSSEC.Enabled,
+			ConfigPath:       absConfig,
+			SocketPath:       socketPath,
+			Mode1Enabled:     cfg.Resolver.Enabled,
+			Mode2Enabled:     cfg.UpstreamService.Enabled,
+			DNSSECEnabled:    cfg.DNSSEC.Enabled,
+			AllowlistEnabled: cfg.Allowlist.Enabled,
 		}
 		// Cache posture for the stats "Cache → Mode:" line. Mode name from config; the
 		// capability flags from the live cache so the descriptor matches actual behavior.
@@ -462,11 +514,37 @@ func main() {
 						stats.SetBlocklistFiles(res.FilesOK)
 						appLogger.Printf("blocklist: reloaded — %d domains, %d wildcards, %d/%d file(s) OK, %d line(s) skipped",
 							res.Domains, res.Wildcards, res.FilesOK, res.FilesOK+res.FilesErr, res.Skipped)
+						warnShadowedAllowlist(dnsAllowlist, dnsBlocklist, appLogger)
 					}()
 					return len(files)
 				}
 			}
-			if err := statistics.ListenAndServe(statsCtx, socketPath, stats, displayVersion(), cacheInfo, statusInfo, listenerInfo, instInfo, auditInfo, reloadInfo); err != nil {
+			// allowlistReloadInfo backs --allowlist-reload: it re-runs the strict
+			// loader against cfg.Allowlist.Files and atomically swaps the live set
+			// in. Unlike the blocklist path this is SYNCHRONOUS — the callback
+			// blocks until the load finishes (allowlists are small) and returns
+			// the one-line reply the CLI prints and uses to pick its exit code.
+			// A failed load leaves the previous set active (the loader never swaps
+			// on error) and the callback returns a failure line naming file:line.
+			// nil when the feature is off, so the socket reports unavailable.
+			var allowlistReloadInfo statistics.AllowlistReloadFunc
+			if cfg.Allowlist.Enabled && dnsAllowlist != nil {
+				files := cfg.Allowlist.Files
+				allowlistReloadInfo = func() (string, error) {
+					if err := dnsAllowlist.LoadFiles(files); err != nil {
+						msg := "allowlist reload FAILED, previous list still active: " + err.Error()
+						appLogger.Printf("allowlist: %s", msg)
+						return "", errors.New(msg)
+					}
+					reply := fmt.Sprintf("allowlist reloaded: %d entries from %d file(s)", dnsAllowlist.Size(), len(files))
+					if warn := warnShadowedAllowlist(dnsAllowlist, dnsBlocklist, appLogger); warn != "" {
+						reply += "; warning: " + warn
+					}
+					appLogger.Printf("allowlist: %s", reply)
+					return reply, nil
+				}
+			}
+			if err := statistics.ListenAndServe(statsCtx, socketPath, stats, buildString(), cacheInfo, statusInfo, listenerInfo, instInfo, auditInfo, reloadInfo, allowlistReloadInfo); err != nil {
 				appLogger.Printf("stats socket error: %v", err)
 			}
 		}()
@@ -503,6 +581,14 @@ func main() {
 		dnsValidator.SetResolver(resolv)
 	}
 
+	// Build ONE shared policy from the allowlist (nil when disabled) and the
+	// blocklist (may be empty while its background load is in progress, which is
+	// its documented behavior). The same instance is handed to the Mode 1 server
+	// and the Mode 2 service so the allowlist cannot be bypassed by switching
+	// transports — a sandbox that can reach rcvd over DoH/DoT/DoQ would otherwise
+	// forward denied names the same way Mode 1 does for the port-5300 path.
+	dnsPolicy := policy.New(dnsAllowlist, dnsBlocklist, stats)
+
 	// Require at least one mode to be enabled, else there is nothing to run.
 	if !cfg.Resolver.Enabled && !cfg.UpstreamService.Enabled {
 		appLogger.Println("error: no mode enabled — set resolver.enabled and/or upstream_service.enabled")
@@ -514,6 +600,10 @@ func main() {
 	// disables the resolver — in that case skip straight to the upstream service.
 	if cfg.Resolver.Enabled {
 		srv = server.NewServer(cfg, resolv, dnsCache, dnsBlocklist, dnsValidator, stats, appLogger.Logger)
+		// Wire the shared policy (allowlist+blocklist) into Mode 1. The same
+		// dnsPolicy is handed to the Mode 2 service below so every transport
+		// enforces identical decisions.
+		srv.SetPolicy(dnsPolicy)
 		if err := srv.Start(context.Background()); err != nil {
 			appLogger.Printf("error: failed to start resolver: %v", err)
 			os.Exit(1)
@@ -531,6 +621,11 @@ func main() {
 		// Route the DoQ listener's benign-idle server-side lines (client-closed write, idle
 		// accept close) through the leveled logger so they log at debug, not unconditionally.
 		upstreamSvc.SetDebugLogger(appLogger)
+		// Hand the shared policy to the Mode 2 service. Each listener (DoH/DoT/DoQ) gets
+		// its own reference during Start, so they enforce the same allowlist/blocklist
+		// decision Mode 1 does — a sandbox can no longer bypass the allowlist by switching
+		// transports.
+		upstreamSvc.SetPolicy(dnsPolicy)
 
 		// Start upstream service
 		if err := upstreamSvc.Start(context.Background()); err != nil {
@@ -574,6 +669,7 @@ func main() {
 					}
 				}
 			}
+			warnShadowedAllowlist(dnsAllowlist, dnsBlocklist, appLogger)
 		}()
 	}
 
@@ -736,6 +832,40 @@ func configHintPath(extra, configPath string) string {
 	return configPath
 }
 
+// warnShadowedAllowlist logs one warning line when blocklist entries fully cover
+// allowlist entries (a name in both lists always gets NXDOMAIN) and returns the
+// message, or "" when nothing is shadowed. Overlap is valid config, so this never
+// fails startup or a reload. It runs after each blocklist load or reload and after
+// each allowlist reload, since the blocklist loads in the background.
+func warnShadowedAllowlist(allow *allowlist.Allowlist, block *blocklist.Blocklist, appLogger *logger.Logger) string {
+	msg := policy.ShadowSummary(policy.Shadowed(allow, block))
+	if msg != "" {
+		appLogger.Printf("allowlist: warning: %s", msg)
+	}
+	return msg
+}
+
+// loadAllowlistAtStartup builds the allowlist (when enabled) and synchronously
+// loads its files. Returns nil, nil when the feature is off. On any load error
+// (missing file, invalid line, empty result) it logs the failure and returns a
+// non-nil error so the caller can os.Exit(1) — a default-deny allowlist that
+// loads nothing would silently cut off all DNS, so refusing to start is the
+// safer failure mode than starting "deny all". Split out from main() so the
+// startup-path contract is testable (cmd/rcvd/main_test.go).
+func loadAllowlistAtStartup(cfg *config.Config, appLogger *logger.Logger) (*allowlist.Allowlist, error) {
+	if !cfg.Allowlist.Enabled {
+		return nil, nil
+	}
+	dnsAllowlist := allowlist.New()
+	if err := dnsAllowlist.LoadFiles(cfg.Allowlist.Files); err != nil {
+		appLogger.Printf("allowlist: %v", err)
+		return nil, err
+	}
+	appLogger.Printf("allowlist: default-deny, %d entries from %d file(s)",
+		dnsAllowlist.Size(), len(cfg.Allowlist.Files))
+	return dnsAllowlist, nil
+}
+
 func printHelp() {
 	fmt.Print(`RCVD — Resilient, Cryptographic, Verifiable DNS
 
@@ -754,6 +884,8 @@ Flags:
     	query running instance for live posture audit and exit
   -blocklist-reload
     	trigger an async blocklist file reload in the running instance and exit
+  -allowlist-reload
+    	trigger a synchronous allowlist file reload in the running instance and exit (exit 0 on success, 1 on failure)
   -verify-upstream
     	verify upstream TLS certificates (CA-validating) and exit
   -verify-pin

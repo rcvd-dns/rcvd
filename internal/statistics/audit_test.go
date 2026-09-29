@@ -3,6 +3,7 @@ package statistics
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -200,7 +201,7 @@ func TestSocketVerbSwitch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, nil)
+		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, nil, nil)
 	}()
 
 	// Wait for the socket to come up.
@@ -249,7 +250,7 @@ func TestSocketReloadVerb(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, reload)
+		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, reload, nil)
 	}()
 	waitForSocket(t, socketPath)
 
@@ -277,7 +278,7 @@ func TestSocketReloadUnavailable(t *testing.T) {
 	defer cancel()
 	go func() {
 		// nil reload => feature not wired (blocklists disabled).
-		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, nil)
+		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, nil, nil)
 	}()
 	waitForSocket(t, socketPath)
 
@@ -309,4 +310,103 @@ func waitForSocket(t *testing.T, path string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("socket %s did not come up", path)
+}
+
+// TestSocketAllowlistReloadSuccess exercises the synchronous allowlist reload
+// path: with a wired callback the server replies with the exact success line
+// the CLI prints verbatim, and the callback ran to completion (not fire-and-forget).
+func TestSocketAllowlistReloadSuccess(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "rcvd-test.sock")
+	stats := New()
+	info := InstanceInfo{Mode1Enabled: true}
+	audit := AuditInfo{Mode1Enabled: true}
+
+	var fired int
+	reload := func() (string, error) {
+		fired++
+		return "allowlist reloaded: 7 entries from 2 file(s)", nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, nil, reload)
+	}()
+	waitForSocket(t, socketPath)
+
+	out, err := QueryAllowlistReload(socketPath)
+	if err != nil {
+		t.Fatalf("QueryAllowlistReload: %v", err)
+	}
+	if !strings.HasPrefix(out, "allowlist reloaded:") {
+		t.Errorf("expected success line, got %q", out)
+	}
+	if !strings.Contains(out, "7 entries") || !strings.Contains(out, "2 file(s)") {
+		t.Errorf("success line missing counts, got %q", out)
+	}
+	if fired != 1 {
+		t.Errorf("reload callback fired %d times, want 1", fired)
+	}
+}
+
+// TestSocketAllowlistReloadFailure covers the fail-closed path: a callback that
+// returns an error is rendered as the failure line (the CLI parses this prefix
+// to choose exit code 1). The error string IS the socket reply, so the operator
+// sees the failing file:line in one line.
+func TestSocketAllowlistReloadFailure(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "rcvd-test.sock")
+	stats := New()
+	info := InstanceInfo{Mode1Enabled: true}
+	audit := AuditInfo{Mode1Enabled: true}
+
+	reload := func() (string, error) {
+		return "", errors.New("allowlist reload FAILED, previous list still active: /etc/rcvd/allow.txt:4: entry \"-bad-.com\" has an invalid label")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, nil, reload)
+	}()
+	waitForSocket(t, socketPath)
+
+	out, err := QueryAllowlistReload(socketPath)
+	if err != nil {
+		t.Fatalf("QueryAllowlistReload: %v", err)
+	}
+	if !strings.HasPrefix(out, "allowlist reload FAILED") {
+		t.Errorf("expected FAILED prefix, got %q", out)
+	}
+	// The reply must name the failing file:line so the operator can locate the edit.
+	if !strings.Contains(out, "/etc/rcvd/allow.txt:4") {
+		t.Errorf("failure line must name file:line, got %q", out)
+	}
+}
+
+// TestSocketAllowlistReloadUnavailable exercises the off switch: a nil
+// callback (no allowlist configured) yields the "unavailable" reply so the CLI
+// can exit 1 without ever touching the live set.
+func TestSocketAllowlistReloadUnavailable(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "rcvd-test.sock")
+	stats := New()
+	info := InstanceInfo{Mode1Enabled: true}
+	audit := AuditInfo{Mode1Enabled: true}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = ListenAndServe(ctx, socketPath, stats, "v", nil, nil, nil, info, audit, nil, nil)
+	}()
+	waitForSocket(t, socketPath)
+
+	out, err := QueryAllowlistReload(socketPath)
+	if err != nil {
+		t.Fatalf("QueryAllowlistReload: %v", err)
+	}
+	if !strings.Contains(out, "unavailable") {
+		t.Errorf("expected unavailable message, got %q", out)
+	}
+	if !strings.Contains(out, "not enabled") {
+		t.Errorf("expected unavailable reason (not enabled), got %q", out)
+	}
 }

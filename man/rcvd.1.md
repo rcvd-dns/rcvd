@@ -1,4 +1,4 @@
-# rcvd 1 "21 July 2026" "rcvd 0.1.0" "User Commands"
+# rcvd 1 "28 September 2026" "rcvd 0.3.0" "User Commands"
 
 ## NAME
 
@@ -57,6 +57,12 @@ Connect to the running instance's Unix socket and print the live posture report:
 Connect to the running instance's Unix socket and trigger a hot-reload of the blocklist **files** the running process already knows about — that is, the set of **[blocklists] files** it read when it started — then exit. Requires **stats_enabled = true** — the Unix control socket this connects to is created by the statistics feature, so with statistics off there is no socket to reach and the command cannot signal the daemon (the blocklist itself still filters normally; only this live-reload verb is unavailable). The reload re-reads those same files from disk, rebuilds the entire in-memory set, and atomically swaps it in, so both **added and removed** domains *within the known files* take effect without restarting the process — preserving statistics, cache, and connections. It is asynchronous and non-blocking: the command returns immediately with an acknowledgment while the (potentially minute-long) rescan runs in the background, exactly like the startup load, so DNS is never paused. Final counts are written to the daemon log when the swap completes. Edit the file(s), then run this. Only local **files** are reloaded; **update_urls** are not re-fetched.
 
 Note: this reloads the *contents* of the already-known files only. It does **not** re-read the config, so **adding a new path to [blocklists] files (or removing one) is NOT picked up by a hot-reload** — the running process keeps the file set it started with. Changing the set of blocklist files requires restarting the process so it re-reads the config.
+
+**-allowlist-reload**
+
+Connect to the running instance's Unix socket, re-read the **[allowlist] files** the process loaded at startup, and atomically swap in the new set, then exit. Requires **stats_enabled = true**. Unlike **-blocklist-reload** this is **synchronous**: the command waits for the result and prints one line. On success it prints **allowlist reloaded: N entries from M file(s)** and exits **0**. On any error (missing file, invalid line, zero entries across all files) it prints **allowlist reload FAILED, previous list still active:** followed by **file:line: reason**, and exits **1**; the running list is left unchanged, so a bad edit never widens or empties it. With no allowlist enabled it prints **allowlist reload unavailable: allowlist not enabled** and exits **1**. Names removed from the list are refused immediately, even if an answer for them is cached.
+
+Like **-blocklist-reload**, this does **not** re-read the config: adding or removing a path in **[allowlist] files** requires a restart. To retire a temporary allowlist file without a restart, empty it (comments only) and reload; deleting the file makes the reload fail and keeps the previous list active.
 
 **-verify-upstream**
 
@@ -128,6 +134,11 @@ path always goes with **-config**:
 
 	# edit /etc/rcvd/domainswild — add or remove domains
 	rcvd -config /etc/rcvd/rcvd.toml -blocklist-reload
+
+**Reload the allowlist after editing it (synchronous; exit status reports the result)**
+
+	# edit /etc/rcvd/allow.txt — add or remove domains
+	rcvd -config /etc/rcvd/rcvd.toml -allowlist-reload || echo "reload failed; old list still active"
 
 **Verify TLS certificates of all configured upstreams (CA validation)**
 
@@ -266,6 +277,17 @@ resolves next to the config file). Setting more than one token source is a start
 (auto-detected); wildcard entries (**\*.example.com**) are supported. **update_urls** lists remote
 blocklists to fetch. A matched name is answered without leaving the host.
 
+**[allowlist]** — Default-deny name filtering; off by default. **enabled** turns it on.
+**mode** is required and must be **default-deny** (**exempt** is reserved and rejected).
+**files** is a required list of one or more plain domain lists; entries from all files are merged.
+**example.com** allows the apex and every name below it; **\*.example.com** allows names below it
+but not the apex. Bare TLDs, hosts-file lines, underscore labels, and malformed names are rejected
+at load time with a **file:line** error. Only names under a listed suffix resolve. Every other name
+is answered **REFUSED** (with RFC 8914 Extended DNS Error 18, Prohibited, when the query carried
+EDNS), never forwarded, never cached. It applies to every listener: UDP/TCP and DoH/DoT/DoQ.
+The list loads before any listener starts; if it cannot be loaded, **rcvd** exits with status **1**
+instead of starting unfiltered. See **BLOCKLISTS AND ALLOWLISTS** below.
+
 **[fallback]** — Multi-upstream health and failover. **phase1_duration_s** (default **300**) is
 the startup window of aggressive health checks before settling into steady state.
 **phase2_failure_threshold** is the number of consecutive failures that marks an upstream DOWN.
@@ -289,9 +311,54 @@ including the rare root KSK rollover, which rcvd does not yet track automaticall
 is **text** (default) or **json**. **file** is the log destination: an explicit path, or the
 special values **stdout** or **stderr**. When unset it defaults to **/var/log/rcvd/rcvd.log**.
 
-**stats_enabled** — Set to **true** to enable the Unix socket for **-stats** and **-audit**.
+**stats_enabled** — Set to **true** to enable the Unix socket for **-stats**, **-audit**,
+**-blocklist-reload**, and **-allowlist-reload**. With it off, none of these can reach the daemon.
 
 See **docs/CONFIG.md** in the source tree for full documentation of all keys.
+
+## BLOCKLISTS AND ALLOWLISTS
+
+A single **rcvd** process may enable **[blocklists]**, **[allowlist]**, both, or neither. Enabling
+both is a supported combination: it is **not** a configuration conflict, and **rcvd starts
+normally** with both filters active. Both are shared by every listener in the process (Mode 1
+UDP/TCP and Mode 2 DoH/DoT/DoQ).
+
+Note that **[blocklists] enabled** defaults to **true**, so a config that adds **[allowlist]** and
+has no **[blocklists]** section still runs both filters (the blocklist is simply empty).
+
+Every query is checked in this order; the first step that answers wins:
+
+	1. Malformed query (not exactly one question)  → FORMERR
+	2. DDR resolver.arpa (Mode 2 only)              → answered locally
+	3. Name NOT under an allowlist suffix           → REFUSED (+ EDE 18)
+	4. Name on the blocklist                        → NXDOMAIN
+	5. Cached answer                                → served from cache
+	6. Otherwise                                    → forwarded upstream (encrypted)
+
+So with both enabled:
+
+- A name outside the allowlist is **REFUSED**, whether or not it is also on the blocklist. It
+  counts toward **Denied (allowlist)** in **-stats**, not **Blocked (NXDOMAIN)**.
+- A name inside the allowlist that is also on the blocklist gets **NXDOMAIN**: the blocklist wins
+  inside allowed suffixes. Use this to carve single hosts out of a broad allowed domain.
+- A name inside the allowlist and not on the blocklist resolves normally.
+- The same name in both lists is **not** a startup error. The blocklist wins, so the name and
+  its subdomains get **NXDOMAIN**. **rcvd** logs one warning line naming each allowlist entry the
+  blocklist fully covers, after the background blocklist load finishes and after each
+  **-blocklist-reload** or **-allowlist-reload**; the **-allowlist-reload** reply carries the same
+  warning. Carving a single host out of an allowed domain does not trigger it.
+
+In none of these cases is a refused or blocked name sent upstream or cached.
+
+The two filters fail differently at startup, on purpose:
+
+- **Blocklist** loads in the background after the listeners start. Until it finishes, nothing is
+  blocked and queries resolve normally. A bad blocklist file is logged and skipped.
+- **Allowlist** loads before any listener starts. A missing file, invalid line, or empty result
+  makes **rcvd** exit with status **1**. It never serves queries without the allowlist in force.
+
+Reloading is independent: **-blocklist-reload** and **-allowlist-reload** each touch only their own
+list, and a failed allowlist reload leaves both lists unchanged.
 
 ## EXIT STATUS
 
@@ -299,7 +366,8 @@ See **docs/CONFIG.md** in the source tree for full documentation of all keys.
 	Success.
 
 **1**
-	Configuration error, upstream probe failure, or runtime error.
+	Configuration error (including an allowlist that fails to load at startup), upstream probe
+	failure, runtime error, or a failed or unavailable **-allowlist-reload**.
 
 **2**
 	Invalid command-line usage (e.g. unexpected positional argument).

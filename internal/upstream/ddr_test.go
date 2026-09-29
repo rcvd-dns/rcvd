@@ -33,11 +33,11 @@ func svcbParam(svcb *dns.SVCB, k dns.SVCBKey) dns.SVCBKeyValue {
 
 // dohOnlyZone is the common QA shape: a Mode-2 box serving only DoH.
 func dohOnlyZone() ddrZone {
-	return newDDRZone("doh3.qa.rcvd.net", "0.0.0.0:443", "", "", true, nil)
+	return newDDRZone("doh3.example.net", "0.0.0.0:443", "", "", true, nil)
 }
 
 func TestDDRZone_DoHDesignation(t *testing.T) {
-	z := newDDRZone("doh3.qa.rcvd.net", "0.0.0.0:443", "", "", true, nil)
+	z := newDDRZone("doh3.example.net", "0.0.0.0:443", "", "", true, nil)
 	resp := z.answer(ddrQuery())
 	if resp == nil {
 		t.Fatal("answer returned nil for a valid DDR query")
@@ -58,7 +58,7 @@ func TestDDRZone_DoHDesignation(t *testing.T) {
 	if svcb.Priority != ddrPriorityDoH {
 		t.Errorf("priority = %d, want %d", svcb.Priority, ddrPriorityDoH)
 	}
-	if svcb.Target != "doh3.qa.rcvd.net." {
+	if svcb.Target != "doh3.example.net." {
 		t.Errorf("target = %q, want fully-qualified cert hostname", svcb.Target)
 	}
 	// RFC 9462 §4: the TargetName MUST NOT be "." or "resolver.arpa".
@@ -78,7 +78,7 @@ func TestDDRZone_DoHDesignation(t *testing.T) {
 // TestDDRZone_AllTransports covers RFC 9462 §3: a resolver serving several encrypted
 // transports advertises one SVCB record each, ordered by the priority field.
 func TestDDRZone_AllTransports(t *testing.T) {
-	z := newDDRZone("qa.rcvd.net", "0.0.0.0:443", "0.0.0.0:853", "0.0.0.0:853", false, nil)
+	z := newDDRZone("example.net", "0.0.0.0:443", "0.0.0.0:853", "0.0.0.0:853", false, nil)
 	resp := z.answer(ddrQuery())
 	if resp == nil {
 		t.Fatal("answer returned nil")
@@ -131,7 +131,7 @@ func TestDDRZone_AllTransports(t *testing.T) {
 // reach the endpoint at all.
 func TestDDRZone_PortSvcParamOnlyWhenNonDefault(t *testing.T) {
 	t.Run("default ports omit the port SvcParam", func(t *testing.T) {
-		z := newDDRZone("qa.rcvd.net", "0.0.0.0:443", "0.0.0.0:853", "0.0.0.0:853", false, nil)
+		z := newDDRZone("example.net", "0.0.0.0:443", "0.0.0.0:853", "0.0.0.0:853", false, nil)
 		resp := z.answer(ddrQuery())
 		if resp == nil || len(resp.Answer) != 3 {
 			t.Fatalf("expected 3 designations, got %v", resp)
@@ -145,7 +145,7 @@ func TestDDRZone_PortSvcParamOnlyWhenNonDefault(t *testing.T) {
 
 	t.Run("non-default ports emit the port SvcParam", func(t *testing.T) {
 		// DoH off 443, DoT off 853, DoQ off 853 — each must carry its port.
-		z := newDDRZone("qa.rcvd.net", "0.0.0.0:8443", "0.0.0.0:8853", "0.0.0.0:9853", false, nil)
+		z := newDDRZone("example.net", "0.0.0.0:8443", "0.0.0.0:8853", "0.0.0.0:9853", false, nil)
 		resp := z.answer(ddrQuery())
 		if resp == nil || len(resp.Answer) != 3 {
 			t.Fatalf("expected 3 designations, got %v", resp)
@@ -164,7 +164,7 @@ func TestDDRZone_PortSvcParamOnlyWhenNonDefault(t *testing.T) {
 	})
 
 	t.Run("mixed: default DoH omits, non-default DoT emits", func(t *testing.T) {
-		z := newDDRZone("qa.rcvd.net", "0.0.0.0:443", "0.0.0.0:8530", "", false, nil)
+		z := newDDRZone("example.net", "0.0.0.0:443", "0.0.0.0:8530", "", false, nil)
 		resp := z.answer(ddrQuery())
 		if resp == nil || len(resp.Answer) != 2 {
 			t.Fatalf("expected 2 designations, got %v", resp)
@@ -182,7 +182,7 @@ func TestDDRZone_PortSvcParamOnlyWhenNonDefault(t *testing.T) {
 // TestDDRZone_OnlyRunningTransports asserts rcvd advertises what it actually serves —
 // a DoT-only box designates DoT alone, never a DoH endpoint it does not run.
 func TestDDRZone_OnlyRunningTransports(t *testing.T) {
-	z := newDDRZone("dot.qa.rcvd.net", "", "0.0.0.0:853", "", false, nil)
+	z := newDDRZone("dot.example.net", "", "0.0.0.0:853", "", false, nil)
 	resp := z.answer(ddrQuery())
 	if resp == nil {
 		t.Fatal("answer returned nil")
@@ -383,7 +383,7 @@ func TestDDRHints(t *testing.T) {
 // TestDDRZone_HintsOnEveryDesignation asserts the address hints ride every advertised
 // record, not just the first — a client selecting DoT must get hints too.
 func TestDDRZone_HintsOnEveryDesignation(t *testing.T) {
-	z := newDDRZone("qa.rcvd.net", "0.0.0.0:443", "0.0.0.0:853", "", false,
+	z := newDDRZone("example.net", "0.0.0.0:443", "0.0.0.0:853", "", false,
 		[]string{"35.159.188.251", "2a05:d014:16d8:ae00::11"})
 	resp := z.answer(ddrQuery())
 	if resp == nil || len(resp.Answer) != 2 {
@@ -459,7 +459,7 @@ func TestDOHListener_DDR_EndToEnd(t *testing.T) {
 		t.Fatalf("create DoH listener: %v", err)
 	}
 	// Enable DDR the way Service.Start() does.
-	listener.ddr = newDDRZone("doh3.qa.rcvd.net", "0.0.0.0:443", "", "", false, nil)
+	listener.ddr = newDDRZone("doh3.example.net", "0.0.0.0:443", "", "", false, nil)
 	defer listener.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())

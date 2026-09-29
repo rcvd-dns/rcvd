@@ -21,10 +21,12 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/rcvd-dns/rcvd/internal/allowlist"
 	"github.com/rcvd-dns/rcvd/internal/blocklist"
 	"github.com/rcvd-dns/rcvd/internal/cache"
 	"github.com/rcvd-dns/rcvd/internal/config"
 	"github.com/rcvd-dns/rcvd/internal/dnssec"
+	"github.com/rcvd-dns/rcvd/internal/policy"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
 )
 
@@ -37,13 +39,15 @@ const dnsUDPBufSize = 1232
 
 // Server listens for incoming DNS queries on UDP/TCP and forwards them to resolvers.
 // CRITICAL: No cleartext DNS responses allowed. If all resolvers fail, return SERVFAIL.
-// Queries are cached per TTL; cache can be disabled via config.
-// Blocked domains return NXDOMAIN (domain does not exist).
+// Queries are cached per TTL; cache can be disabled via config. Blocked domains
+// return NXDOMAIN; allowlist-denied names return REFUSED + EDE 18.
 type Server struct {
 	cfg       *config.Config
 	resolver  Resolver             // abstraction for DoQ/DoT/DoH
 	cache     *cache.Cache         // optional DNS response cache
-	blocklist *blocklist.Blocklist // optional blocklist for domain filtering
+	blocklist *blocklist.Blocklist // optional blocklist for domain filtering (kept here so callers can wire it via NewServer)
+	allowlist *allowlist.Allowlist // optional default-deny allowlist (deprecated setter; prefer SetPolicy)
+	policy    *policy.Policy       // composed policy: allowlist + blocklist + stats. Nil disables filtering.
 	validator *dnssec.Validator    // optional DNSSEC validator
 	stats     *statistics.Stats    // optional runtime statistics
 	logger    *log.Logger
@@ -62,8 +66,12 @@ type Resolver interface {
 
 // NewServer creates a DNS server for the given config.
 // Pass nil for cache, blocklist, validator, or stats if they are disabled.
+//
+// A default Policy is constructed from the supplied blocklist (nil allowlist) so the
+// blocklist is enforced without an explicit SetPolicy call. SetPolicy / SetAllowlist
+// override this default before Start.
 func NewServer(cfg *config.Config, resolver Resolver, dnsCache *cache.Cache, dnsBlocklist *blocklist.Blocklist, dnsValidator *dnssec.Validator, stats *statistics.Stats, logger *log.Logger) *Server {
-	return &Server{
+	s := &Server{
 		cfg:       cfg,
 		resolver:  resolver,
 		cache:     dnsCache,
@@ -72,6 +80,28 @@ func NewServer(cfg *config.Config, resolver Resolver, dnsCache *cache.Cache, dns
 		stats:     stats,
 		logger:    logger,
 	}
+	s.policy = policy.New(nil, dnsBlocklist, stats)
+	return s
+}
+
+// SetPolicy wires the composed policy (allowlist + blocklist + stats) into the server.
+// Call BEFORE Start. nil disables the feature (the pre-feature default). The same
+// Policy object should be shared with the Mode 2 listeners so every transport enforces
+// identical decisions.
+func (s *Server) SetPolicy(p *policy.Policy) {
+	s.policy = p
+}
+
+// SetAllowlist is a backward-compatible shim over SetPolicy: it builds a Policy from
+// the allowlist plus the blocklist + stats already on the Server, so callers (and the
+// pre-existing test suite) that pass an Allowlist directly keep working unchanged.
+// New code should call SetPolicy.
+func (s *Server) SetAllowlist(a *allowlist.Allowlist) {
+	if a == nil {
+		s.SetPolicy(nil)
+		return
+	}
+	s.SetPolicy(policy.New(a, s.blocklist, s.stats))
 }
 
 // Start begins listening for DNS queries on the configured address.
@@ -364,10 +394,18 @@ func formErrResponse(query *dns.Msg) *dns.Msg {
 	}
 }
 
+// policyResponse is a one-line delegate to the shared Policy. The composition logic
+// (allowlist-then-blocklist, EDE 18 attachment, counter updates) lives in
+// internal/policy so every transport (UDP/TCP/DoH/DoT/DoQ) shares the same decision.
+func (s *Server) policyResponse(query *dns.Msg) *dns.Msg {
+	return s.policy.Response(query)
+}
+
 // handleDNSQuery processes a single DNS query from the network.
-// Query comes in via UDP, parsed, checked against blocklist, forwarded to resolver, response sent back.
+// Query comes in via UDP, parsed, run through policyResponse (blocklist today),
+// then forwarded to the resolver on a cache miss. Response sent back.
 // CRITICAL: If resolver fails, return SERVFAIL (never cleartext).
-// Blocked domains return NXDOMAIN.
+// Queries the policy refuses are answered locally and never forwarded.
 func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 	// Parse incoming DNS query
 	query := &dns.Msg{}
@@ -401,42 +439,29 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 		return
 	}
 
-	// Check blocklist before cache/resolver
-	if s.blocklist != nil && len(query.Question) > 0 {
-		domain := query.Question[0].Name
-		if s.blocklist.IsBlocked(domain) {
-			if s.stats != nil {
-				atomic.AddInt64(&s.stats.BlockedQueries, 1)
-			}
-			// Return NXDOMAIN (domain does not exist)
-			response := &dns.Msg{
-				MsgHdr: dns.MsgHdr{
-					Id:       query.Id,
-					Response: true,
-					Rcode:    dns.RcodeNameError, // NXDOMAIN
-				},
-				Question: query.Question,
-			}
-			// Echo EDNS0 so a DNSSEC-probing stub resolver sees an EDNS-capable
-			// server and does not downgrade (Issue 28).
-			ensureResponseEDNS(response, query)
-			respBuf, err := response.Pack()
-			if err != nil {
-				s.logger.Printf("pack NXDOMAIN response error: %v", err)
-				return
-			}
-			udpAddr, ok := remoteAddr.(*net.UDPAddr)
-			if ok {
-				_, err = s.udpConn.WriteToUDP(respBuf, udpAddr)
-				if err != nil {
-					s.logger.Printf("UDP write NXDOMAIN error: %v", err)
-				}
-			}
-			if s.stats != nil {
-				s.stats.RecordResponse(response.Rcode)
-			}
+	// Apply query policy. Order matters: policy runs BEFORE the cache lookup so the
+	// allowlist can never leak via a cached positive answer. Synthesized replies
+	// flow through the same tail (EDNS, pack, WriteToUDP, RecordResponse).
+	if response := s.policyResponse(query); response != nil {
+		// Echo EDNS0 so a DNSSEC-probing stub resolver sees an EDNS-capable
+		// server and does not downgrade (Issue 28).
+		ensureResponseEDNS(response, query)
+		respBuf, err := response.Pack()
+		if err != nil {
+			s.logger.Printf("pack policy response error: %v", err)
 			return
 		}
+		udpAddr, ok := remoteAddr.(*net.UDPAddr)
+		if ok {
+			_, err = s.udpConn.WriteToUDP(respBuf, udpAddr)
+			if err != nil {
+				s.logger.Printf("UDP write policy response error: %v", err)
+			}
+		}
+		if s.stats != nil {
+			s.stats.RecordResponse(response.Rcode)
+		}
+		return
 	}
 
 	// Check cache (before querying upstream)
@@ -642,23 +667,11 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 			response = formErrResponse(query)
 		}
 
-		// Check blocklist first
-		if response == nil && s.blocklist != nil && len(query.Question) > 0 {
-			domain := query.Question[0].Name
-			if s.blocklist.IsBlocked(domain) {
-				if s.stats != nil {
-					atomic.AddInt64(&s.stats.BlockedQueries, 1)
-				}
-				// Return NXDOMAIN (domain does not exist)
-				response = &dns.Msg{
-					MsgHdr: dns.MsgHdr{
-						Id:       query.Id,
-						Response: true,
-						Rcode:    dns.RcodeNameError, // NXDOMAIN
-					},
-					Question: query.Question,
-				}
-			}
+		// Apply query policy. Order matters: policy runs BEFORE the cache lookup so the
+		// allowlist can never leak via a cached positive answer. The shared send
+		// tail below handles EDNS + RecordResponse.
+		if response == nil {
+			response = s.policyResponse(query)
 		}
 
 		// Check cache (before querying upstream)

@@ -78,18 +78,29 @@ type ListenerLive struct {
 // blocklist is wired, in which case the server reports that reload is unavailable.
 type ReloadFunc func() (files int)
 
+// AllowlistReloadFunc triggers a synchronous hot-reload of the allowlist files in
+// the running daemon (the --allowlist-reload verb). It returns a single-line reply
+// the server hands straight back to the CLI: a success line carrying entry/file
+// counts, or a failure line naming the failing file:line. It is synchronous (unlike
+// the blocklist path) because allowlists are small and the operator must see whether
+// the reload worked before any subsequent query is trusted. A nil AllowlistReloadFunc
+// means no allowlist is wired; the server then reports reload unavailable.
+type AllowlistReloadFunc func() (string, error)
+
 // ListenAndServe starts a Unix socket server that responds to stats and audit queries.
 // Blocks until ctx is cancelled. Removes the socket file on return.
 // info carries static per-instance metadata (config/socket paths, mode flags) into each snapshot.
 // audit carries the static posture facts rendered for an "AUDIT" request (see QueryAudit).
 //
 // Request protocol (backward compatible): the server reads one line first. "AUDIT" → posture
-// snapshot; "RELOAD-BLOCKLIST" → trigger an async blocklist reload and acknowledge; "STATS",
-// EOF, or anything else → statistics. An older --stats client writes nothing, so the server
-// sees EOF and renders stats, unchanged.
+// snapshot; "RELOAD-BLOCKLIST" → trigger an async blocklist reload and acknowledge;
+// "RELOAD-ALLOWLIST" → run a synchronous allowlist reload and return its one-line result;
+// "STATS", EOF, or anything else → statistics. An older --stats client writes nothing, so
+// the server sees EOF and renders stats, unchanged.
 //
 // reload is fire-and-forget (may be nil if no blocklist is configured); see ReloadFunc.
-func ListenAndServe(ctx context.Context, socketPath string, stats *Stats, version string, cacheInfo CacheInfoFunc, statusInfo StatusFunc, listenerInfo ListenerFunc, info InstanceInfo, audit AuditInfo, reload ReloadFunc) error {
+// allowlistReload is synchronous (may be nil if no allowlist is configured); see AllowlistReloadFunc.
+func ListenAndServe(ctx context.Context, socketPath string, stats *Stats, version string, cacheInfo CacheInfoFunc, statusInfo StatusFunc, listenerInfo ListenerFunc, info InstanceInfo, audit AuditInfo, reload ReloadFunc, allowlistReload AllowlistReloadFunc) error {
 	// Remove stale socket
 	os.Remove(socketPath)
 
@@ -148,6 +159,26 @@ func ListenAndServe(ctx context.Context, socketPath string, stats *Stats, versio
 				}
 				files := reload()
 				conn.Write([]byte(fmt.Sprintf("blocklist reload started (%d file(s), background)\n", files)))
+				return
+			}
+
+			if verb == "RELOAD-ALLOWLIST" {
+				// Synchronous: the callback returns the exact reply line the CLI
+				// prints. Allowlists are small, so the operator gets a verdict on
+				// the spot instead of a "started in background" punt.
+				if allowlistReload == nil {
+					conn.Write([]byte("allowlist reload unavailable: allowlist not enabled\n"))
+					return
+				}
+				reply, err := allowlistReload()
+				if err != nil {
+					// err is wrapped with the daemon's logged message; the
+					// socket reply already names the failing file:line, so the
+					// CLI exits 1 and the previous list stays active.
+					conn.Write([]byte(err.Error() + "\n"))
+					return
+				}
+				conn.Write([]byte(reply + "\n"))
 				return
 			}
 
@@ -249,6 +280,30 @@ func QueryReload(socketPath string) (string, error) {
 	defer conn.Close()
 
 	if _, err := conn.Write([]byte("RELOAD-BLOCKLIST\n")); err != nil {
+		return "", fmt.Errorf("write reload request: %w", err)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(conn, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("read reload response: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// QueryAllowlistReload connects to a running rcvd instance's socket and triggers a
+// SYNCHRONOUS allowlist reload, returning the daemon's one-line verdict (success,
+// failure, or unavailable). The CLI parses the prefix to decide its exit code:
+// 0 on success, 1 on failure or unavailable. The caller is expected to be the
+// rcvd --allowlist-reload command itself.
+func QueryAllowlistReload(socketPath string) (string, error) {
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		return "", fmt.Errorf("connect to %s: %w (is rcvd running with stats_enabled?)", socketPath, err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("RELOAD-ALLOWLIST\n")); err != nil {
 		return "", fmt.Errorf("write reload request: %w", err)
 	}
 

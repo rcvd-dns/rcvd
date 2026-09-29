@@ -18,6 +18,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/rcvd-dns/rcvd/internal/cache"
 	applog "github.com/rcvd-dns/rcvd/internal/logger"
+	"github.com/rcvd-dns/rcvd/internal/policy"
 	"github.com/rcvd-dns/rcvd/internal/resolver"
 	"github.com/rcvd-dns/rcvd/internal/statistics"
 )
@@ -41,7 +42,8 @@ type DOQListener struct {
 	udpConn   net.PacketConn
 	closeOnce sync.Once // guards Close (idempotent without racing Serve's field reads)
 
-	ddr ddrZone // RFC 9462 resolver.arpa zone: designations + §6.4 containment
+	ddr    ddrZone        // RFC 9462 resolver.arpa zone: designations + §6.4 containment
+	policy *policy.Policy // shared with Mode 1: allowlist+blocklist. nil = enforcement off.
 }
 
 // NewDOQListener creates a new DoQ listener.
@@ -102,6 +104,10 @@ func NewDOQListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 // and re-asks on a fresh one, so the write-reset / idle-close here is expected and recovered,
 // never lost data. nil (the default) keeps the prior always-on behavior for those lines.
 func (d *DOQListener) SetDebugLogger(l *applog.Logger) { d.debugLog = l }
+
+// SetPolicy wires the shared policy (allowlist + blocklist + stats) into the listener.
+// Must be called before Serve. nil disables enforcement.
+func (d *DOQListener) SetPolicy(p *policy.Policy) { d.policy = p }
 
 // logBenignIdle emits a server-side benign-idle line at debug when a leveled logger is wired;
 // otherwise falls back to the plain logger so nothing is silently dropped when no debug logger
@@ -317,11 +323,16 @@ func (d *DOQListener) handleStream(ctx context.Context, stream *quic.Stream) {
 			},
 			Question: query.Question,
 		}
-	} else {
+	} else if resp := d.ddr.answer(query); resp != nil {
 		// DDR (RFC 9462): resolver.arpa is served locally in its entirety — the SVCB probe
 		// gets rcvd's designations, everything else in the zone gets NODATA. nil means the
 		// query is not for that zone and falls through to normal resolution below.
-		response = d.ddr.answer(query)
+		response = resp
+	} else if resp := d.policy.Response(query); resp != nil {
+		// Policy (shared with Mode 1): same allowlist+blocklist decision every
+		// transport must enforce in lockstep. Runs BEFORE the cache so a denied
+		// qname is never served from a positive answer and never reaches upstream.
+		response = resp
 	}
 
 	// SHARED CACHE check (same object as Mode 1) — serve a cached answer without an

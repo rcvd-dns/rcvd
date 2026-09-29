@@ -1,5 +1,5 @@
 .nh
-.TH rcvd 1 "21 July 2026" "rcvd 0.1.0" "User Commands"
+.TH rcvd 1 "28 September 2026" "rcvd 0.3.0" "User Commands"
 .SH NAME
 rcvd - Resilient, Cryptographic, Verifiable DNS
 
@@ -67,6 +67,15 @@ Connect to the running instance's Unix socket and trigger a hot-reload of the bl
 
 .PP
 Note: this reloads the \fIcontents\fP of the already-known files only. It does \fBnot\fP re-read the config, so \fBadding a new path to [blocklists] files (or removing one) is NOT picked up by a hot-reload\fP — the running process keeps the file set it started with. Changing the set of blocklist files requires restarting the process so it re-reads the config.
+
+.PP
+\fB-allowlist-reload\fP
+
+.PP
+Connect to the running instance's Unix socket, re-read the \fB[allowlist] files\fP the process loaded at startup, and atomically swap in the new set, then exit. Requires \fBstats_enabled = true\fP\&. Unlike \fB-blocklist-reload\fP this is \fBsynchronous\fP: the command waits for the result and prints one line. On success it prints \fBallowlist reloaded: N entries from M file(s)\fP and exits \fB0\fP\&. On any error (missing file, invalid line, zero entries across all files) it prints \fBallowlist reload FAILED, previous list still active:\fP followed by \fBfile:line: reason\fP, and exits \fB1\fP; the running list is left unchanged, so a bad edit never widens or empties it. With no allowlist enabled it prints \fBallowlist reload unavailable: allowlist not enabled\fP and exits \fB1\fP\&. Names removed from the list are refused immediately, even if an answer for them is cached.
+
+.PP
+Like \fB-blocklist-reload\fP, this does \fBnot\fP re-read the config: adding or removing a path in \fB[allowlist] files\fP requires a restart. To retire a temporary allowlist file without a restart, empty it (comments only) and reload; deleting the file makes the reload fail and keeps the previous list active.
 
 .PP
 \fB-verify-upstream\fP
@@ -170,6 +179,14 @@ rcvd -config /etc/rcvd/rcvd.toml -audit
 .EX
 # edit /etc/rcvd/domainswild — add or remove domains
 rcvd -config /etc/rcvd/rcvd.toml -blocklist-reload
+.EE
+
+.PP
+\fBReload the allowlist after editing it (synchronous; exit status reports the result)\fP
+
+.EX
+# edit /etc/rcvd/allow.txt — add or remove domains
+rcvd -config /etc/rcvd/rcvd.toml -allowlist-reload || echo "reload failed; old list still active"
 .EE
 
 .PP
@@ -344,6 +361,18 @@ resolves next to the config file). Setting more than one token source is a start
 blocklists to fetch. A matched name is answered without leaving the host.
 
 .PP
+\fB[allowlist]\fP — Default-deny name filtering; off by default. \fBenabled\fP turns it on.
+\fBmode\fP is required and must be \fBdefault-deny\fP (\fBexempt\fP is reserved and rejected).
+\fBfiles\fP is a required list of one or more plain domain lists; entries from all files are merged.
+\fBexample.com\fP allows the apex and every name below it; \fB*\&.example.com\fP allows names below it
+but not the apex. Bare TLDs, hosts-file lines, underscore labels, and malformed names are rejected
+at load time with a \fBfile:line\fP error. Only names under a listed suffix resolve. Every other name
+is answered \fBREFUSED\fP (with RFC 8914 Extended DNS Error 18, Prohibited, when the query carried
+EDNS), never forwarded, never cached. It applies to every listener: UDP/TCP and DoH/DoT/DoQ.
+The list loads before any listener starts; if it cannot be loaded, \fBrcvd\fP exits with status \fB1\fP
+instead of starting unfiltered. See \fBBLOCKLISTS AND ALLOWLISTS\fP below.
+
+.PP
 \fB[fallback]\fP — Multi-upstream health and failover. \fBphase1_duration_s\fP (default \fB300\fP) is
 the startup window of aggressive health checks before settling into steady state.
 \fBphase2_failure_threshold\fP is the number of consecutive failures that marks an upstream DOWN.
@@ -371,10 +400,66 @@ is \fBtext\fP (default) or \fBjson\fP\&. \fBfile\fP is the log destination: an e
 special values \fBstdout\fP or \fBstderr\fP\&. When unset it defaults to \fB/var/log/rcvd/rcvd.log\fP\&.
 
 .PP
-\fBstats_enabled\fP — Set to \fBtrue\fP to enable the Unix socket for \fB-stats\fP and \fB-audit\fP\&.
+\fBstats_enabled\fP — Set to \fBtrue\fP to enable the Unix socket for \fB-stats\fP, \fB-audit\fP,
+\fB-blocklist-reload\fP, and \fB-allowlist-reload\fP\&. With it off, none of these can reach the daemon.
 
 .PP
 See \fBdocs/CONFIG.md\fP in the source tree for full documentation of all keys.
+
+.SH BLOCKLISTS AND ALLOWLISTS
+A single \fBrcvd\fP process may enable \fB[blocklists]\fP, \fB[allowlist]\fP, both, or neither. Enabling
+both is a supported combination: it is \fBnot\fP a configuration conflict, and \fBrcvd starts
+normally\fP with both filters active. Both are shared by every listener in the process (Mode 1
+UDP/TCP and Mode 2 DoH/DoT/DoQ).
+
+.PP
+Note that \fB[blocklists] enabled\fP defaults to \fBtrue\fP, so a config that adds \fB[allowlist]\fP and
+has no \fB[blocklists]\fP section still runs both filters (the blocklist is simply empty).
+
+.PP
+Every query is checked in this order; the first step that answers wins:
+
+.EX
+1. Malformed query (not exactly one question)  → FORMERR
+2. DDR resolver.arpa (Mode 2 only)              → answered locally
+3. Name NOT under an allowlist suffix           → REFUSED (+ EDE 18)
+4. Name on the blocklist                        → NXDOMAIN
+5. Cached answer                                → served from cache
+6. Otherwise                                    → forwarded upstream (encrypted)
+.EE
+
+.PP
+So with both enabled:
+.IP \(bu 2
+A name outside the allowlist is \fBREFUSED\fP, whether or not it is also on the blocklist. It
+counts toward \fBDenied (allowlist)\fP in \fB-stats\fP, not \fBBlocked (NXDOMAIN)\fP\&.
+.IP \(bu 2
+A name inside the allowlist that is also on the blocklist gets \fBNXDOMAIN\fP: the blocklist wins
+inside allowed suffixes. Use this to carve single hosts out of a broad allowed domain.
+.IP \(bu 2
+A name inside the allowlist and not on the blocklist resolves normally.
+.IP \(bu 2
+The same name in both lists is \fBnot\fP a startup error. The blocklist wins, so the name and
+its subdomains get \fBNXDOMAIN\fP\&. \fBrcvd\fP logs one warning line naming each allowlist entry the
+blocklist fully covers, after the background blocklist load finishes and after each
+\fB-blocklist-reload\fP or \fB-allowlist-reload\fP; the \fB-allowlist-reload\fP reply carries the same
+warning. Carving a single host out of an allowed domain does not trigger it.
+
+.PP
+In none of these cases is a refused or blocked name sent upstream or cached.
+
+.PP
+The two filters fail differently at startup, on purpose:
+.IP \(bu 2
+\fBBlocklist\fP loads in the background after the listeners start. Until it finishes, nothing is
+blocked and queries resolve normally. A bad blocklist file is logged and skipped.
+.IP \(bu 2
+\fBAllowlist\fP loads before any listener starts. A missing file, invalid line, or empty result
+makes \fBrcvd\fP exit with status \fB1\fP\&. It never serves queries without the allowlist in force.
+
+.PP
+Reloading is independent: \fB-blocklist-reload\fP and \fB-allowlist-reload\fP each touch only their own
+list, and a failed allowlist reload leaves both lists unchanged.
 
 .SH EXIT STATUS
 \fB0\fP
@@ -382,7 +467,8 @@ See \fBdocs/CONFIG.md\fP in the source tree for full documentation of all keys.
 
 .PP
 \fB1\fP
-	Configuration error, upstream probe failure, or runtime error.
+	Configuration error (including an allowlist that fails to load at startup), upstream probe
+	failure, runtime error, or a failed or unavailable \fB-allowlist-reload\fP\&.
 
 .PP
 \fB2\fP
