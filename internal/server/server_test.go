@@ -967,8 +967,19 @@ func TestResponseCounterConservationEndToEnd(t *testing.T) {
 		_ = sendUDPQuery(t, addr, q, dns.TypeA)
 	}
 
-	snap := stats.TakeSnapshot(0, 100, statistics.InstanceInfo{})
-	sum := snap.SuccessResponses + snap.ServfailResponses + snap.NxdomainResponses + snap.OtherResponses
+	// The server buckets a response right after writing it to the socket, so the last
+	// reply can reach us a moment before its counter lands. Wait for the buckets to
+	// settle (bounded) instead of taking the snapshot at the same instant.
+	var snap statistics.Snapshot
+	var sum int64
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		snap = stats.TakeSnapshot(0, 100, statistics.InstanceInfo{})
+		sum = snap.SuccessResponses + snap.ServfailResponses + snap.NxdomainResponses + snap.OtherResponses
+		if sum >= int64(len(queries)) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if snap.TotalQueries != int64(len(queries)) {
 		t.Fatalf("TotalQueries: expected %d, got %d", len(queries), snap.TotalQueries)
 	}
