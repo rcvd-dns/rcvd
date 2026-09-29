@@ -179,11 +179,16 @@ func (s *Server) serveUDP() {
 			continue
 		}
 
-		// Handle query in goroutine
+		// Handle query in goroutine. Copy the datagram first: buf is reused by the next
+		// ReadFromUDP, so a burst of concurrent queries (systemd-resolved sends A+AAAA
+		// in parallel) would otherwise all parse the last packet and answer every
+		// client with the wrong ID and qtype.
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.handleDNSQuery(buf[:n], remoteAddr)
+			s.handleDNSQuery(pkt, remoteAddr)
 		}()
 	}
 }
