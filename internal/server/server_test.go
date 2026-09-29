@@ -1706,3 +1706,65 @@ func TestAllowlistReloadFailedLeavesPreviousSetActive(t *testing.T) {
 		t.Error("previous entries must still be allowed after a failed reload")
 	}
 }
+
+// echoResolver answers every query with an A record for the queried name, so a reply
+// can be checked against the query that caused it.
+type echoResolver struct{}
+
+func (echoResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	resp := new(dns.Msg)
+	resp.SetReply(msg)
+	resp.Answer = []dns.RR{&dns.A{
+		Hdr: dns.RR_Header{Name: msg.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+		A:   net.IPv4(192, 0, 2, 1),
+	}}
+	return resp, nil
+}
+
+func (echoResolver) Close() error { return nil }
+
+// TestServerUDPConcurrentBurstCorrelation fires a burst of distinct UDP queries from
+// separate sockets at once (the systemd-resolved A+AAAA fan-out pattern) and asserts
+// every reply carries its own query's ID and question. Regression: serveUDP handed each
+// goroutine a slice of one shared read buffer, so a burst parsed the last packet N times.
+func TestServerUDPConcurrentBurstCorrelation(t *testing.T) {
+	cfg := &config.Config{Resolver: config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"}}
+	srv := NewServer(cfg, echoResolver{}, nil, nil, nil, nil, log.New(io.Discard, "", 0))
+	if err := srv.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer srv.Stop(2 * time.Second)
+	addr := srv.UDPAddr().String()
+
+	const n = 64
+	for round := 0; round < 20; round++ {
+		var wg sync.WaitGroup
+		errs := make(chan string, n)
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				q := new(dns.Msg)
+				q.SetQuestion(dns.Fqdn(strings.Repeat("a", i%20+1)+".burst.test"), dns.TypeA)
+				q.Id = uint16(round*n + i + 1)
+				c := &dns.Client{Net: "udp", Timeout: 2 * time.Second}
+				<-start
+				r, _, err := c.Exchange(q, addr)
+				if err != nil {
+					errs <- err.Error()
+					return
+				}
+				if r.Id != q.Id || len(r.Question) != 1 || r.Question[0].Name != q.Question[0].Name {
+					errs <- "mismatched reply"
+				}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for e := range errs {
+			t.Fatalf("round %d: %s", round, e)
+		}
+	}
+}
