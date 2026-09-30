@@ -26,7 +26,7 @@ import (
 // unambiguous question per pinned upstream: does the configured pin still MATCH
 // what the server presents? — so it correctly reports OK for a pin-only, self-
 // signed leg (posture 3, the encrypted LAN leg) that --verify-upstream FALSE-fails
-// with "certificate signed by unknown authority". See repos/rcvd/TODO.md.
+// with "certificate signed by unknown authority".
 //
 // Upstreams with NO pin configured are skipped (with a note) so the two verbs never
 // overlap in meaning. Returns formatted output and allOK (true only if every pinned
