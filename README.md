@@ -5,7 +5,7 @@
 **DNS engine that only uses standards compliant encrypted transports**
 
 `rcvd` is a privacy-first DNS **engine** in a single static Go binary: all upstream
-queries encrypted (DoQ → DoT → DoH), with built-in caching, blocklists, and DNSSEC
+queries encrypted (DoQ, DoT, or DoH), with built-in caching, blocklists, and DNSSEC
 validation. It runs in one of four shapes:
 
 - **Mode 1 (Resolver):** Accept plain DNS from local clients, encrypt everything upstream.
@@ -43,8 +43,9 @@ Core Idea: `rcvd` does not do outbound cleartext dns.
 | DNSSEC Validation | RFC 4033-4035 | Supported |
 | ODoH — Oblivious DoH | RFC 9230 | Planned |
 
-**Protocol priority: DoQ → DoT → DoH** within each upstream (DoH is the port-443 escape
-hatch, not the preferred protocol); the upstreams themselves are tried in config-file order.
+**Upstream order:** upstreams are tried in the order they appear in the config file; the
+first is primary and the rest are fallbacks. Within one upstream that enables several
+transports, rcvd prefers DoQ, then DoT, then DoH (DoH is the port-443 escape hatch).
 
 ## Features
 
