@@ -165,7 +165,7 @@ level = "info"
 format = "text"
 ```
 
-See `repos/rcvd/etc/rcvd-resolver.toml` for the full production example.
+See `etc/mode1-forwarder-3providers.toml` for a complete example.
 
 ---
 

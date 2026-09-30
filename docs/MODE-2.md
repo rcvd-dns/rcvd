@@ -251,8 +251,8 @@ level = "info"
 format = "text"
 ```
 
-See `repos/rcvd/etc/rcvd-upstream.toml` for the full production example.
-See `repos/rcvd/docs/STANDALONE-DOH-DEPLOYMENT.md` for deployment patterns.
+See `etc/mode2-doh-service.toml` for a complete example.
+See `docs/standalone-DoH-deployment.md` for deployment patterns.
 
 ---
 
