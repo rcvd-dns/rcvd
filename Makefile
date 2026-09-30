@@ -39,7 +39,7 @@ build-linux-amd64:
 	scripts/build-linux-amd64.sh
 
 build-linux-arm64:
-	scripts/build-alpine-arm64.sh
+	scripts/build-linux-arm64.sh
 
 build-mac-amd64:
 	scripts/build-macos-amd64.sh
