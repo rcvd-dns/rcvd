@@ -18,7 +18,7 @@ func TestAllowedMatchesTable(t *testing.T) {
 	a := New()
 	load := func(body string) {
 		t.Helper()
-		if err := scanAllowlistReader(strings.NewReader(body), a.domains, a.wildcard, "test"); err != nil {
+		if err := scanAllowlistReader(strings.NewReader(body), a.domains, a.wildcard, a.exact, "test"); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
@@ -432,7 +432,7 @@ func TestLoadFilesMultipleFiles(t *testing.T) {
 // Bypasses LoadFiles so tests focused on matching can seed without a temp file.
 func load(t *testing.T, a *Allowlist, body string) {
 	t.Helper()
-	if err := scanAllowlistReader(strings.NewReader(body), a.domains, a.wildcard, "test"); err != nil {
+	if err := scanAllowlistReader(strings.NewReader(body), a.domains, a.wildcard, a.exact, "test"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 }
@@ -522,6 +522,37 @@ func TestEntriesSortedCopy(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("Entries = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestExactEntryMatchesOnlyItsName: "=name" allows that name and nothing under it,
+// and an exact entry cannot be a wildcard.
+func TestExactEntryMatchesOnlyItsName(t *testing.T) {
+	a := New()
+	if err := scanAllowlistReader(strings.NewReader("=api.example.com\n"), a.domains, a.wildcard, a.exact, "test"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cases := map[string]bool{
+		"api.example.com":   true,
+		"API.example.com.":  true,
+		"x.api.example.com": false,
+		"example.com":       false,
+		"other.example.com": false,
+	}
+	for name, want := range cases {
+		if got := a.Allowed(name); got != want {
+			t.Errorf("Allowed(%q) = %v, want %v", name, got, want)
+		}
+	}
+	if got := a.Entries(); len(got) != 1 || got[0] != "=api.example.com" {
+		t.Errorf("Entries = %v", got)
+	}
+
+	for _, bad := range []string{"=*.example.com", "=com", "="} {
+		b := New()
+		if err := scanAllowlistReader(strings.NewReader(bad+"\n"), b.domains, b.wildcard, b.exact, "test"); err == nil {
+			t.Errorf("%q: want load error", bad)
 		}
 	}
 }

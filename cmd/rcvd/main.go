@@ -588,6 +588,10 @@ func main() {
 	// transports — a sandbox that can reach rcvd over DoH/DoT/DoQ would otherwise
 	// forward denied names the same way Mode 1 does for the port-5300 path.
 	dnsPolicy := policy.New(dnsAllowlist, dnsBlocklist, stats)
+	if cfg.Allowlist.Enabled {
+		qtypes, _ := cfg.Allowlist.QTypeCodes() // already validated in config.Load
+		dnsPolicy.SetQTypes(qtypes)
+	}
 
 	// Require at least one mode to be enabled, else there is nothing to run.
 	if !cfg.Resolver.Enabled && !cfg.UpstreamService.Enabled {
@@ -863,6 +867,9 @@ func loadAllowlistAtStartup(cfg *config.Config, appLogger *logger.Logger) (*allo
 	}
 	appLogger.Printf("allowlist: default-deny, %d entries from %d file(s)",
 		dnsAllowlist.Size(), len(cfg.Allowlist.Files))
+	if len(cfg.Allowlist.QTypes) > 0 {
+		appLogger.Printf("allowlist: qtypes restricted to %s", strings.Join(cfg.Allowlist.QTypes, ", "))
+	}
 	return dnsAllowlist, nil
 }
 

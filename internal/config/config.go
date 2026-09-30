@@ -4,11 +4,14 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/miekg/dns"
 )
 
 // Config represents the full RCVD configuration.
@@ -161,7 +164,8 @@ type BlocklistConfig struct {
 // transports are configured (UDP/TCP for Mode 1, DoH/DoT/DoQ for Mode 2).
 // Enforcement goes through the shared internal/policy package so both modes
 // make identical decisions and the allowlist cannot be bypassed by switching
-// transports.
+// transports. QTypes optionally narrows the record types allowed in queries and
+// in answers; answer-section names and CNAME/DNAME targets are always checked.
 //
 // Enabled and Mode are read on the running path; the synchronous load lives in
 // cmd/rcvd/main.go so a failed load is a startup error, not a silent gap.
@@ -172,6 +176,29 @@ type AllowlistConfig struct {
 	Enabled bool     `toml:"enabled"` // default: false
 	Mode    string   `toml:"mode"`    // required when enabled; only "default-deny" is implemented
 	Files   []string `toml:"files"`   // one or more plain domain lists (one domain per line, # comments, blank lines ignored); entries from all files are merged, and a bad line in any file fails the whole load
+	QTypes  []string `toml:"qtypes"`  // optional: allowed query and answer record types (e.g. ["A", "AAAA"]); empty = any type
+}
+
+// QTypeCodes maps QTypes to wire type codes. Names are case-insensitive; an unknown
+// name, or a duplicate, is an error. Returns nil for an empty list (any type allowed).
+func (a AllowlistConfig) QTypeCodes() ([]uint16, error) {
+	if len(a.QTypes) == 0 {
+		return nil, nil
+	}
+	seen := make(map[uint16]bool, len(a.QTypes))
+	codes := make([]uint16, 0, len(a.QTypes))
+	for _, name := range a.QTypes {
+		code, ok := dns.StringToType[strings.ToUpper(strings.TrimSpace(name))]
+		if !ok {
+			return nil, fmt.Errorf("allowlist.qtypes: unknown record type %q", name)
+		}
+		if seen[code] {
+			return nil, fmt.Errorf("allowlist.qtypes: duplicate record type %q", name)
+		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	return codes, nil
 }
 
 // CacheConfig — DNS response caching.
@@ -532,15 +559,34 @@ func (c *Config) validate(requireToken bool) error {
 		c.Resolver.Listen = "127.0.0.1:5300"
 	}
 
+	// Every listen address must use an IP literal (or an empty host for all interfaces).
+	// Go resolves a hostname through the system resolver when the listener binds, so a
+	// name here would make rcvd's own startup emit a cleartext DNS query.
+	for _, l := range []struct{ field, addr string }{
+		{"resolver.listen", c.Resolver.Listen},
+		{"upstream_service.listen_doh", c.UpstreamService.ListenDoH},
+		{"upstream_service.listen_dot", c.UpstreamService.ListenDoT},
+		{"upstream_service.listen_doq", c.UpstreamService.ListenDoQ},
+		{"metrics.listen", c.Metrics.Listen},
+	} {
+		if err := validateListenAddr(l.addr); err != nil {
+			return fmt.Errorf("%s %q: %w", l.field, l.addr, err)
+		}
+	}
+
 	// Reject resolver binding port 53 on a non-loopback interface.
 	// Port 53 on 0.0.0.0 or a LAN IP makes rcvd a cleartext-accepting stub for the whole
 	// network — violates the zero-cleartext design. Loopback (127.x, ::1) is fine: that is
 	// the intended router deployment (dnsmasq → rcvd 127.0.0.1:53).
+	//
+	// The port is compared numerically (Go also binds "053" and the service name "domain"
+	// to 53), and the host must be a literal loopback IP. An empty host (":53"), "0", or a
+	// hostname all bind every interface or resolve to one that is not loopback.
 	if c.Resolver.Enabled {
 		host, port, err := net.SplitHostPort(c.Resolver.Listen)
-		if err == nil && port == "53" {
+		if err == nil && listenPortIs53(port) {
 			ip := net.ParseIP(host)
-			if ip != nil && !ip.IsLoopback() {
+			if ip == nil || !ip.IsLoopback() {
 				return fmt.Errorf(
 					"resolver listen %q: binding port 53 on a non-loopback interface is not allowed — "+
 						"rcvd must not accept cleartext DNS from the network. "+
@@ -774,6 +820,42 @@ func (c *Config) validateTLSAutomation(requireToken bool) error {
 	return nil
 }
 
+// listenPortIs53 reports whether a listen port string names port 53 the way Go's
+// listeners read it: a decimal number with any leading zeros, or the "domain" service
+// name. Service names are looked up in the local services database only, never over
+// the network.
+func listenPortIs53(port string) bool {
+	if n, err := strconv.Atoi(port); err == nil {
+		return n == 53
+	}
+	n, err := net.LookupPort("udp", port)
+	return err == nil && n == 53
+}
+
+// validateListenAddr checks a host:port listen address without any lookup. Empty is
+// allowed (listener disabled). The host must be empty (all interfaces) or an IP literal,
+// optionally with an IPv6 zone.
+func validateListenAddr(addr string) error {
+	if addr == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid listen address: %w", err)
+	}
+	if port == "" {
+		return fmt.Errorf("listen address needs a port")
+	}
+	if host == "" {
+		return nil
+	}
+	if _, err := netip.ParseAddr(host); err != nil {
+		return fmt.Errorf("listen host must be an IP address, not a hostname " +
+			"(resolving it would send a cleartext DNS query); use e.g. 127.0.0.1, ::1, or 0.0.0.0")
+	}
+	return nil
+}
+
 // validateAllowlist enforces the allowlist fields' required shape. A no-op when
 // disabled (so a placeholder [allowlist] block is harmless); rejects unknown
 // modes and the reserved "exempt" value; requires Files when enabled. Cross-mode
@@ -796,6 +878,9 @@ func (c *Config) validateAllowlist() error {
 	}
 	if len(a.Files) == 0 {
 		return fmt.Errorf("allowlist.files is required when allowlist is enabled (one or more plain-domain-list files)")
+	}
+	if _, err := a.QTypeCodes(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -844,7 +929,7 @@ func (c *Config) Warnings() []string {
 	var w []string
 	if c.Resolver.Enabled {
 		host, port, err := net.SplitHostPort(c.Resolver.Listen)
-		if err == nil && port != "53" {
+		if err == nil && !listenPortIs53(port) {
 			ip := net.ParseIP(host)
 			if ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
 				w = append(w, fmt.Sprintf(

@@ -30,6 +30,7 @@ import (
 type Allowlist struct {
 	domains  map[string]bool // plain domains: example.com
 	wildcard map[string]bool // wildcard domains: *.example.com
+	exact    map[string]bool // exact-only names: =api.example.com (only this subdomain)
 	mu       sync.RWMutex
 }
 
@@ -38,6 +39,7 @@ func New() *Allowlist {
 	return &Allowlist{
 		domains:  make(map[string]bool),
 		wildcard: make(map[string]bool),
+		exact:    make(map[string]bool),
 	}
 }
 
@@ -51,20 +53,22 @@ func New() *Allowlist {
 func (a *Allowlist) LoadFiles(paths []string) error {
 	newDomains := make(map[string]bool)
 	newWildcard := make(map[string]bool)
+	newExact := make(map[string]bool)
 
 	for _, path := range paths {
-		if err := scanAllowlistFile(path, newDomains, newWildcard); err != nil {
+		if err := scanAllowlistFile(path, newDomains, newWildcard, newExact); err != nil {
 			return err
 		}
 	}
 
-	if len(newDomains) == 0 && len(newWildcard) == 0 {
+	if len(newDomains) == 0 && len(newWildcard) == 0 && len(newExact) == 0 {
 		return fmt.Errorf("no entries loaded (file(s) empty or contain only comments): %w", ErrEmptyAllowlist)
 	}
 
 	a.mu.Lock()
 	a.domains = newDomains
 	a.wildcard = newWildcard
+	a.exact = newExact
 	a.mu.Unlock()
 
 	return nil
@@ -79,17 +83,17 @@ var ErrEmptyAllowlist = errors.New("allowlist is empty")
 
 // scanAllowlistFile parses one file into the provided maps (no lock held).
 // First invalid line aborts the whole load with a "file:line" error.
-func scanAllowlistFile(path string, domains, wildcard map[string]bool) error {
+func scanAllowlistFile(path string, domains, wildcard, exact map[string]bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
 
-	return scanAllowlistReader(f, domains, wildcard, path)
+	return scanAllowlistReader(f, domains, wildcard, exact, path)
 }
 
-func scanAllowlistReader(r io.Reader, domains, wildcard map[string]bool, label string) error {
+func scanAllowlistReader(r io.Reader, domains, wildcard, exact map[string]bool, label string) error {
 	scanner := bufio.NewScanner(r)
 	// Allow long lines (e.g. pasted comment blobs).
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -116,12 +120,23 @@ func scanAllowlistReader(r io.Reader, domains, wildcard map[string]bool, label s
 		}
 
 		entry := fields[0]
+		// "=name" allows that one name and nothing below it. The prefix is stripped
+		// before validation, so "=*.example.com" is rejected as an invalid hostname.
+		exactOnly := strings.HasPrefix(entry, "=")
+		if exactOnly {
+			entry = entry[1:]
+			if strings.HasPrefix(entry, "*.") {
+				return fmt.Errorf("%s:%d: exact entry %q cannot be a wildcard", label, lineNo, raw)
+			}
+		}
 		if err := validateAllowlistEntry(entry); err != nil {
 			return fmt.Errorf("%s:%d: %w", label, lineNo, err)
 		}
 
 		normalized := strings.ToLower(strings.TrimSuffix(entry, "."))
-		if strings.HasPrefix(normalized, "*.") {
+		if exactOnly {
+			exact[normalized] = true
+		} else if strings.HasPrefix(normalized, "*.") {
 			wildcard[normalized] = true
 		} else {
 			domains[normalized] = true
@@ -199,14 +214,15 @@ func (a *Allowlist) Allowed(name string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if len(a.domains) == 0 && len(a.wildcard) == 0 {
+	if len(a.domains) == 0 && len(a.wildcard) == 0 && len(a.exact) == 0 {
 		return false
 	}
 
 	domain := strings.ToLower(strings.TrimSuffix(name, "."))
 
-	// Exact match: an apex entry "example.com" allows the apex itself.
-	if a.domains[domain] {
+	// Exact match: an apex entry "example.com" or an exact-only "=example.com"
+	// allows the name itself.
+	if a.domains[domain] || a.exact[domain] {
 		return true
 	}
 
@@ -225,26 +241,30 @@ func (a *Allowlist) Allowed(name string) bool {
 	return false
 }
 
-// Entries returns a sorted copy of the current entries, bare and wildcard ("*.")
-// forms as written (lowercased, no trailing dot).
+// Entries returns a sorted copy of the current entries, bare, wildcard ("*.") and
+// exact-only ("=") forms as written (lowercased, no trailing dot).
 func (a *Allowlist) Entries() []string {
 	a.mu.RLock()
-	out := make([]string, 0, len(a.domains)+len(a.wildcard))
+	out := make([]string, 0, len(a.domains)+len(a.wildcard)+len(a.exact))
 	for d := range a.domains {
 		out = append(out, d)
 	}
 	for w := range a.wildcard {
 		out = append(out, w)
 	}
+	for e := range a.exact {
+		out = append(out, "="+e)
+	}
 	a.mu.RUnlock()
 	sort.Strings(out)
 	return out
 }
 
-// Size returns the number of entries currently in the allowlist (apex + wildcard).
-// Zero means default-deny allows nothing — the safe state before LoadFiles succeeds.
+// Size returns the number of entries currently in the allowlist (apex + wildcard +
+// exact-only). Zero means default-deny allows nothing — the safe state before
+// LoadFiles succeeds.
 func (a *Allowlist) Size() int {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return len(a.domains) + len(a.wildcard)
+	return len(a.domains) + len(a.wildcard) + len(a.exact)
 }

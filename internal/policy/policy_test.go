@@ -342,3 +342,142 @@ func TestShadowSummary(t *testing.T) {
 		t.Errorf("seven:\n got %q\nwant %q", got, want)
 	}
 }
+
+// answerMsg builds an upstream-style reply for query carrying the given answer RRs.
+func answerMsg(t *testing.T, query *dns.Msg, rrs ...string) *dns.Msg {
+	t.Helper()
+	m := new(dns.Msg)
+	m.SetReply(query)
+	for _, s := range rrs {
+		rr, err := dns.NewRR(s)
+		if err != nil {
+			t.Fatalf("NewRR(%q): %v", s, err)
+		}
+		m.Answer = append(m.Answer, rr)
+	}
+	return m
+}
+
+// TestPolicyQTypesRestrictQueries: with a qtype set, an allowed name asked for a type
+// outside the set is REFUSED + EDE 18; a listed type passes through.
+func TestPolicyQTypesRestrictQueries(t *testing.T) {
+	stats := &statistics.Stats{}
+	p := New(seedAllowlist(t, "example.com\n"), nil, stats)
+	p.SetQTypes([]uint16{dns.TypeA, dns.TypeAAAA})
+
+	for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		if got := p.Response(makeQuery("www.example.com.", qt)); got != nil {
+			t.Errorf("%s: want pass-through, got rcode %d", dns.TypeToString[qt], got.Rcode)
+		}
+	}
+	for _, qt := range []uint16{dns.TypeTXT, dns.TypeNULL, dns.TypeCNAME, dns.TypeANY} {
+		q := makeQuery("www.example.com.", qt)
+		q.SetEdns0(1232, false)
+		got := p.Response(q)
+		if got == nil || got.Rcode != dns.RcodeRefused {
+			t.Fatalf("%s: want REFUSED, got %+v", dns.TypeToString[qt], got)
+		}
+		if ede := findEDE(got.IsEdns0()); ede == nil || ede.InfoCode != dns.ExtendedErrorCodeProhibited {
+			t.Errorf("%s: want EDE 18, got %+v", dns.TypeToString[qt], ede)
+		}
+	}
+	if stats.DeniedQueries != 4 {
+		t.Errorf("DeniedQueries = %d, want 4", stats.DeniedQueries)
+	}
+}
+
+// TestPolicyQTypesIgnoredWithoutAllowlist: the qtype set only narrows a default-deny
+// allowlist; a blocklist-only policy stays a pass-through for every type.
+func TestPolicyQTypesIgnoredWithoutAllowlist(t *testing.T) {
+	p := New(nil, nil, nil)
+	p.SetQTypes([]uint16{dns.TypeA})
+	if got := p.Response(makeQuery("example.com.", dns.TypeTXT)); got != nil {
+		t.Errorf("no allowlist: want pass-through, got rcode %d", got.Rcode)
+	}
+	q := makeQuery("example.com.", dns.TypeTXT)
+	resp := answerMsg(t, q, `example.com. 60 IN TXT "x"`)
+	if got := p.Answer(q, resp); got != resp {
+		t.Errorf("no allowlist: Answer replaced the reply")
+	}
+}
+
+// TestPolicyAnswerChecks covers the answer-section check: owner names and CNAME/DNAME
+// targets must be allowed, answer types must be in the qtype set, RRSIGs are skipped.
+func TestPolicyAnswerChecks(t *testing.T) {
+	allow := seedAllowlist(t, "example.com\ncdn.example.net\n")
+	cases := []struct {
+		name   string
+		qtypes []uint16
+		rrs    []string
+		pass   bool
+	}{
+		{"plain A", nil, []string{"www.example.com. 60 IN A 192.0.2.1"}, true},
+		{"CNAME to allowed", nil, []string{
+			"www.example.com. 60 IN CNAME e1.cdn.example.net.",
+			"e1.cdn.example.net. 60 IN A 192.0.2.1"}, true},
+		{"CNAME to unlisted", nil, []string{
+			"www.example.com. 60 IN CNAME x.attacker.test.",
+			"x.attacker.test. 60 IN A 192.0.2.1"}, false},
+		{"CNAME target unlisted, no follow-up", nil, []string{
+			"www.example.com. 60 IN CNAME x.attacker.test."}, false},
+		{"DNAME to unlisted", nil, []string{
+			"example.com. 60 IN DNAME attacker.test."}, false},
+		{"CNAME blocked by A/AAAA qtypes", []uint16{dns.TypeA, dns.TypeAAAA}, []string{
+			"www.example.com. 60 IN CNAME e1.cdn.example.net.",
+			"e1.cdn.example.net. 60 IN A 192.0.2.1"}, false},
+		{"CNAME allowed by A/AAAA/CNAME qtypes", []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME}, []string{
+			"www.example.com. 60 IN CNAME e1.cdn.example.net.",
+			"e1.cdn.example.net. 60 IN A 192.0.2.1"}, true},
+		{"RRSIG skipped", []uint16{dns.TypeA}, []string{
+			"www.example.com. 60 IN A 192.0.2.1",
+			"www.example.com. 60 IN RRSIG A 13 3 60 20300101000000 20200101000000 1 example.com. AAAA"}, true},
+		{"NODATA passes", nil, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stats := &statistics.Stats{}
+			p := New(allow, nil, stats)
+			p.SetQTypes(tc.qtypes)
+			q := makeQuery("www.example.com.", dns.TypeA)
+			resp := answerMsg(t, q, tc.rrs...)
+			got := p.Answer(q, resp)
+			if tc.pass {
+				if got != resp {
+					t.Fatalf("want pass, got rcode %d", got.Rcode)
+				}
+				return
+			}
+			if got.Rcode != dns.RcodeRefused || len(got.Answer) != 0 {
+				t.Fatalf("want empty REFUSED, got rcode %d with %d answers", got.Rcode, len(got.Answer))
+			}
+			if stats.DeniedQueries != 1 {
+				t.Errorf("DeniedQueries = %d, want 1", stats.DeniedQueries)
+			}
+		})
+	}
+}
+
+// TestPolicyAnswerNilSafe: nil receiver and nil reply are both pass-throughs.
+func TestPolicyAnswerNilSafe(t *testing.T) {
+	var p *Policy
+	q := makeQuery("example.com.", dns.TypeA)
+	resp := new(dns.Msg)
+	if got := p.Answer(q, resp); got != resp {
+		t.Errorf("nil policy replaced the reply")
+	}
+	if got := New(seedAllowlist(t, "example.com\n"), nil, nil).Answer(q, nil); got != nil {
+		t.Errorf("nil reply: got %+v", got)
+	}
+}
+
+// TestShadowedExactEntry: an exact-only entry is shadowed when the blocklist covers
+// its one name.
+func TestShadowedExactEntry(t *testing.T) {
+	allow := seedAllowlist(t, "=api.example.com\n=ok.example.org\n")
+	block := blocklist.New(true)
+	block.Add("api.example.com")
+	got := Shadowed(allow, block)
+	if len(got) != 1 || got[0] != "=api.example.com" {
+		t.Errorf("Shadowed = %v, want [=api.example.com]", got)
+	}
+}

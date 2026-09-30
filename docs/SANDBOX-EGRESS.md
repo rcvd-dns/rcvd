@@ -6,7 +6,7 @@ This guide describes how to configure rcvd as a default-deny DNS egress gateway 
 
 Isolated execution environments frequently restrict or monitor outbound HTTP and HTTPS egress. However, DNS egress is often left unrestricted or forwarded to a recursive resolver that can query arbitrary names on the public internet. This permits any code running in the sandbox to establish an out-of-band communication channel using DNS queries alone.  
 
-In an NS-delegation attack pattern (such as with dynamic IP mapping services like nip.io), a sandboxed process requests resolution for an attacker-controlled name like `_acme-challenge.203-0-113-7.example.net`. The recursive resolver follows authoritative NS delegations directly to the attacker-controlled nameserver IP (203.0.113.7). Outbound exfiltration data is encoded directly into the query labels, and inbound commands or data return within DNS answer records such as TXT.  
+Data can be encoded into the labels of a query name, and any zone whose name servers someone controls will receive it once a recursive resolver looks the name up. Replies can carry data back the same way. A zone does not need to belong to the attacker for this to work: a zone that answers for arbitrary made-up names, or delegates parts of itself on request, serves just as well.  
 
 Standard DNS blocklists cannot mitigate this risk. Blocklists rely on matching known malicious domains or advertising networks, whereas sandboxed code or an attacker can dynamically synthesize unique, ephemeral subdomains under any registered apex or delegation domain.  
 
@@ -54,65 +54,6 @@ rcvd cannot configure the host packet filter. Operators must implement host fire
 1. Sandbox hosts (e.g., subnet 198.51.100.0/24) may reach only rcvd's listen address and port (192.0.2.53:5300) for DNS. Drop all other UDP and TCP traffic on port 53, port 853 (DoT and DoQ), and block known public DoH endpoints or, preferably, drop all outbound port 443 traffic except an explicit allow set.  
 2. The rcvd gateway host itself must never initiate outbound cleartext DNS on port 53. It may only reach the specific, pinned upstream resolver IP addresses on port 853 or port 443.  
 
-### nftables Example  
-
-The following minimal `nftables.conf` demonstrates packet filtering for a gateway routing traffic between a sandbox subnet and upstream networks:  
-
-```nftables
-table inet filter {
-    chain input {
-        type filter hook input priority filter; policy drop;
-
-        # Allow loopback traffic
-        iif "lo" accept
-
-        # Allow established and related traffic
-        ct state established,related accept
-
-        # Allow management access (e.g. SSH from operator subnet)
-        # ip saddr 192.0.2.0/24 tcp dport 22 accept
-
-        # Allow DNS from sandbox to rcvd Mode 1 on 192.0.2.53:5300
-        ip saddr 198.51.100.0/24 ip daddr 192.0.2.53 udp dport 5300 accept
-        ip saddr 198.51.100.0/24 ip daddr 192.0.2.53 tcp dport 5300 accept
-    }
-
-    chain forward {
-        type filter hook forward priority filter; policy drop;
-
-        # Block direct DNS and DoT/DoQ egress attempts from the sandbox
-        ip saddr 198.51.100.0/24 tcp dport { 53, 853 } drop
-        ip saddr 198.51.100.0/24 udp dport { 53, 853 } drop
-
-        # Note: chain policy drop covers all other forward traffic, including DoH on port 443.
-        # To allow outbound HTTPS for the sandbox, add an explicit destination allow set here:
-        # ip saddr 198.51.100.0/24 ip daddr { 203.0.113.20, 203.0.113.21 } tcp dport 443 accept
-
-        # Allow established outbound traffic
-        ct state established,related accept
-    }
-
-    chain output {
-        type filter hook output priority filter; policy drop;
-
-        # Allow loopback traffic
-        oif "lo" accept
-
-        # Allow established and related traffic
-        ct state established,related accept
-
-        # Permit rcvd to connect only to pinned upstream resolver on encrypted ports
-        ip daddr 203.0.113.10 tcp dport 853 accept
-        ip daddr 203.0.113.10 udp dport 853 accept
-        ip daddr 203.0.113.10 tcp dport 443 accept
-
-        # Explicitly drop any outbound cleartext DNS from the gateway host
-        udp dport 53 drop
-        tcp dport 53 drop
-    }
-}
-```
-
 ## rcvd Configuration  
 
 Below is a complete, minimal configuration for running rcvd in Mode 1 with the allowlist enabled.  
@@ -136,6 +77,7 @@ pinned_pubkey = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 enabled = true
 mode    = "default-deny"
 files   = ["/etc/rcvd/allow.txt"]
+qtypes  = ["A", "AAAA", "CNAME"]
 
 [logging]
 file = "stderr"
@@ -148,8 +90,21 @@ Key operational behaviors:
 - The allowlist applies to both Mode 1 and Mode 2 listeners.  
 - The allowlist loads before any listener starts. If it is enabled and cannot be loaded (missing file, empty, or invalid line), rcvd refuses to start. It never runs open while loading.  
 - `mode = "exempt"` is reserved and rejected by configuration validation.  
+- `qtypes` restricts query types, and the record types an answer may carry. `["A", "AAAA"]` is the tightest useful set; add `"CNAME"` when allowed names are aliases (common with CDNs). TXT, NULL and ANY are the high-bandwidth tunnel types, so leave them out unless a workload needs them.  
+- Answers are checked as well as queries. If any answer record, or a CNAME/DNAME target, falls outside the allowlist or `qtypes`, the whole reply is refused (REFUSED + EDE 18). A CNAME to a CDN therefore needs the CDN name listed too.  
 - `files` accepts more than one path, and entries from all files are merged. A common pattern is a narrow base list plus a broader temporary list, for example `files = ["/etc/rcvd/allow.txt", "/etc/rcvd/allow-temp.txt"]`. To retire the temporary entries, empty that file (comments only) and run `rcvd -allowlist-reload`; the base list keeps serving. Every listed file must exist, and a bad line in any file fails the whole load, so the previous list stays active. The load also fails if all files together contain no entries.  
 - `rcvd -allowlist-reload` re-reads the allowlist files in the running daemon and swaps them in atomically, without a restart. It requires `stats_enabled = true` (the control socket). On success it prints `allowlist reloaded: N entries from M file(s)` and exits 0. On any error it prints `allowlist reload FAILED, previous list still active: ...` and exits 1; the previous list keeps serving. Names removed from the list are refused immediately, even if an answer is cached.  
+
+### Choosing qtypes  
+
+`qtypes` accepts any standard record type name, case-insensitive. The same list governs both the query type and the record types allowed in the answer. Two common choices:  
+
+```toml
+qtypes = ["A", "AAAA"]            # addresses only; CNAME aliases get refused
+qtypes = ["A", "AAAA", "CNAME"]   # addresses, and aliases such as CDNs
+```
+
+Leaving `qtypes` out allows every type. It has no effect unless the allowlist is enabled.  
 
 ### /etc/rcvd/allow.txt  
 
@@ -166,6 +121,9 @@ example.com
 # Allow all subdomains under example.org, but not the apex itself
 *.example.org
 
+# Allow only this subdomain (preferred for sandboxes)
+=api.example.net
+
 # Permitted source repositories and registry endpoints (placeholders)
 registry.example.net
 git.example.net
@@ -180,10 +138,12 @@ The following table summarizes rcvd query handling:
 | Allowed name | NOERROR (or upstream code) | Yes | Yes | Name matches allowlist suffix; query forwards over encrypted upstream. |
 | Denied name | REFUSED | No | No | Name not permitted by allowlist. Returns REFUSED with RFC 8914 EDE code 18 (Prohibited) if client sent EDNS. |
 | Allowed, but blocklisted | NXDOMAIN | No | No | Domain matches allowlist suffix but matches `[blocklists]`. Blocklist rules take precedence. |
+| Allowed name, disallowed qtype | REFUSED | No | No | Query type is not in `qtypes`. EDE 18 as above. |
+| Allowed name, answer leaves allowlist | REFUSED | Yes | Yes (raw reply) | An answer record or CNAME/DNAME target is outside the allowlist or `qtypes`. Checked on every serve, including cache hits. |
 | DDR `resolver.arpa` | NOERROR | No | No | Discovery of Designated Resolvers query answered locally by Mode 2. |
 | Upstream failure | SERVFAIL | Attempted | No | Upstream unreachable or encryption verification fails. rcvd never falls back to cleartext. |
 
-Denied queries increment the `Denied (allowlist):` metric displayed in `rcvd --stats`.  
+Denied queries and refused answers increment the `Denied (allowlist):` metric displayed in `rcvd --stats`.  
 
 ## Verification  
 
@@ -201,10 +161,10 @@ The output should report `status: NOERROR` and return the expected address recor
 
 ### 2. Test Denied Name Interception  
 
-Query an unlisted or simulated exfiltration domain:  
+Query a name that is not on the allowlist:  
 
 ```console
-$ dig @192.0.2.53 -p 5300 _acme-challenge.203-0-113-7.example.net TXT
+$ dig @192.0.2.53 -p 5300 www.example.net A
 ```
 
 Verify that the response returns `status: REFUSED` and includes an RFC 8914 Extended DNS Error option:  
@@ -254,17 +214,9 @@ This capture confirms:
 
 ## Limitations  
 
-- **Trusted Parent Suffixes**: Suffix-level matching allows any subdomain beneath an entry like `example.com`. If an allowed domain hosts user-controlled wildcard records or public routing services, sandboxed code can still encode data into those subdomains. Keep allowlist entries restricted strictly to trusted zones.  
+- **Trusted Parent Suffixes**: Suffix-level matching allows any subdomain beneath an entry like `example.com`. The upstream resolver performs recursion, so a query for an allowed name reaches whichever name servers that zone delegates to, and rcvd cannot see that hop. If an allowed zone hosts user-controlled wildcard records or delegates subtrees on request, sandboxed code can encode data into those subdomains and have it delivered to a server it controls. rcvd cannot tell such zones apart from any other. Prefer exact `=name` entries, and keep suffix entries to zones you control.  
+- **Answer checks trust the reply**: The answer-section check sees what the upstream returns. It stops an allowed name from handing the sandbox data from outside the allowlist; it cannot stop the outbound query that the upstream's recursion already sent.  
 - **Defense in Depth**: DNS egress control addresses out-of-band DNS tunneling. It does not replace network-level restrictions on HTTP, HTTPS, or raw TCP/UDP outbound connections.  
-
-## Roadmap  
-
-The following security enhancements are planned for subsequent releases:  
-- **Query-type allowlist**: Restrict allowable query types (e.g., permitting only A, AAAA, CNAME, and HTTPS records, while refusing TXT, NULL, and ANY records).  
-- **Underscore label enforcement**: Require underscore-prefixed labels (such as `_acme-challenge`) to have explicit individual allowlist entries rather than inheriting permission from an allowed parent domain.  
-- **Tunnel heuristics**: Real-time traffic analysis for anomalies, including query name length, label entropy, unique-subdomain velocity per client, and unusually large response payloads.  
-- **Alert and kill hook**: Configurable notification hooks and automated shutdown actions triggered on the first denied or anomalous query.  
-- **Built-in self-test**: An integrated verification utility demonstrating that the DNS path is closed and denied names are refused without forwarding.  
 
 ## Sources  
 

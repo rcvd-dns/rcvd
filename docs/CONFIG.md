@@ -596,6 +596,7 @@ files   = [
   "/etc/rcvd/allow.txt",
   "/etc/rcvd/allow-temp.txt"
 ]
+qtypes  = ["A", "AAAA"]        # optional; default: any type
 ```
 
 The inverse of a blocklist: only names under a listed suffix resolve. Every other name is
@@ -616,13 +617,30 @@ See `docs/SANDBOX-EGRESS.md` for a full deployment guide including firewall rule
   - Format: one domain per line; `#` comments and blank lines are ignored
   - `example.com` allows the apex and every name below it
   - `*.example.com` allows names below it, but not the apex
+  - `=api.example.com` allows only this subdomain, and nothing below it. Prefer this form
+    for sandboxes: a suffix entry lets the sandbox pick any label under it.
   - Rejected at load time: bare TLDs, hosts-file lines (`0.0.0.0 example.com`), names with
     underscore labels, and malformed names. The error names the file and line.
+  - A suffix entry allows any name the client makes up under it. For a zone that answers for
+    made-up names, or delegates parts of itself on request, that reopens DNS egress. Use exact
+    `=` entries where that matters.
+
+- `qtypes` (list of strings, optional) — Record types allowed in queries and answers
+  - Default: empty (any type)
+  - Names are case-insensitive; an unknown or duplicate type is a startup error
+  - `["A", "AAAA"]` is the tightest useful set. Add `"CNAME"` if allowed names are aliases,
+    e.g. to a CDN. Leaving out TXT, NULL and ANY removes the highest-bandwidth tunnel types.
 
 **Allowlist Behavior:**
 - Denied names get **REFUSED**. If the query carried EDNS, the reply includes an RFC 8914
   Extended DNS Error, code 18 (Prohibited).
 - Denied queries are never forwarded upstream and never cached.
+- A query for a type outside `qtypes` is refused the same way, before it is forwarded.
+- Answers are checked too. A forwarded or cached reply is refused (REFUSED + EDE 18) if any
+  answer record is owned by, or is a CNAME/DNAME pointing at, a name outside the allowlist,
+  or has a type outside `qtypes`. So `www.example.com CNAME x.cdn.example.net` needs
+  `cdn.example.net` (or `=x.cdn.example.net`) listed as well, and `"CNAME"` in `qtypes` when
+  it is set. The cache keeps the raw reply, so an allowlist reload applies to it at once.
 - Applies to every listener: Mode 1 (UDP/TCP) and Mode 2 (DoH/DoT/DoQ).
 - Evaluation order: malformed query (FORMERR) → DDR `resolver.arpa` (Mode 2 only, answered
   locally) → allowlist → blocklist → cache → upstream. A blocklisted name inside an allowed
@@ -634,8 +652,8 @@ See `docs/SANDBOX-EGRESS.md` for a full deployment guide including firewall rule
 - Fails closed: the list loads before any listener starts. A missing file, an invalid line, or
   zero entries across all files stops rcvd from starting. It never runs open while loading
   (unlike the blocklist, which resolves normally until its load finishes).
-- Denied queries increment the aggregate "Denied (allowlist)" statistic — the denied domain
-  name itself is never logged.
+- Denied queries and refused answers increment the aggregate "Denied (allowlist)" statistic —
+  the denied domain name itself is never logged.
 
 **Reload (`rcvd -allowlist-reload`):**
 - Edit the `files` on disk, then run `rcvd -config … -allowlist-reload`. The list is re-read and

@@ -256,7 +256,7 @@ func (d *DOTListener) handleConnection(conn net.Conn, ctx context.Context) {
 		if response == nil && d.cache != nil {
 			if cached, found := d.cache.Get(query); found {
 				cached.Id = query.Id
-				response = cached
+				response = d.policy.Answer(query, cached)
 				if d.stats != nil {
 					atomic.AddInt64(&d.stats.CacheHits, 1)
 				}
@@ -315,6 +315,8 @@ func (d *DOTListener) handleConnection(conn net.Conn, ctx context.Context) {
 			if d.cache != nil && len(query.Question) > 0 && response.Rcode == dns.RcodeSuccess {
 				d.cache.Put(query, response)
 			}
+			// Serve-time answer check, after the cache write (see policy.Answer).
+			response = d.policy.Answer(query, response)
 		}
 
 		// Normalize EDNS0 so a validating client does not downgrade (Issue 28).

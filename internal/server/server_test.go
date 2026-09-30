@@ -1299,10 +1299,8 @@ func TestAllowlistDenyRefusedNotForwarded(t *testing.T) {
 	udpAddr := srv.UDPAddr().String()
 	tcpAddr := srv.TCPAddr().String()
 
-	// Build a denied qname: NOT under example.com. The attack shape was
-	// "_acme-challenge.<ip>.nip.io" — a synthetic subdomain under an unrelated
-	// parent. We use leak.attacker.example.net to keep the suffix non-empty and
-	// not accidentally collide with anything in the allowlist.
+	// Build a denied qname: NOT under example.com. A subdomain under an unrelated
+	// parent keeps the suffix non-empty without colliding with the allowlist.
 	denied := "leak.attacker.example.net."
 
 	// 1. UDP denied: REFUSED + EDE 18 when the query carried OPT; mock resolver

@@ -189,6 +189,9 @@ Key sections:
 **[resolver]** — Mode 1 forwarder settings. **enabled** activates Mode 1 (a config may define
 this section without turning it on). **listen** sets the address and port (default
 **127.0.0.1:5300**). Binding port 53 on a non-loopback address is rejected at startup.
+Every listen address (including the Mode 2 **listen_doh**, **listen_dot**, and **listen_doq**)
+must use an IP literal or an empty host; hostnames are rejected, since resolving them would
+send a cleartext DNS query.
 
 **[[upstreams]]** — One block per upstream. **host** is the hostname used for TLS SNI and
 certificate validation (required). **name** is an optional label for statistics output, and
@@ -281,7 +284,9 @@ blocklists to fetch. A matched name is answered without leaving the host.
 **mode** is required and must be **default-deny** (**exempt** is reserved and rejected).
 **files** is a required list of one or more plain domain lists; entries from all files are merged.
 **example.com** allows the apex and every name below it; **\*.example.com** allows names below it
-but not the apex. Bare TLDs, hosts-file lines, underscore labels, and malformed names are rejected
+but not the apex; **=api.example.com** allows only this subdomain. The optional **qtypes** list (e.g. **["A", "AAAA"]**) restricts query types, and the record
+types an answer may carry; default is any type. A forwarded or cached answer is also refused when a
+record, or a CNAME/DNAME target, falls outside the allowlist or **qtypes**. Bare TLDs, hosts-file lines, underscore labels, and malformed names are rejected
 at load time with a **file:line** error. Only names under a listed suffix resolve. Every other name
 is answered **REFUSED** (with RFC 8914 Extended DNS Error 18, Prohibited, when the query carried
 EDNS), never forwarded, never cached. It applies to every listener: UDP/TCP and DoH/DoT/DoQ.
@@ -330,10 +335,13 @@ Every query is checked in this order; the first step that answers wins:
 
 	1. Malformed query (not exactly one question)  → FORMERR
 	2. DDR resolver.arpa (Mode 2 only)              → answered locally
-	3. Name NOT under an allowlist suffix           → REFUSED (+ EDE 18)
+	3. Name NOT under an allowlist suffix, or
+	   qtype NOT in allowlist qtypes                → REFUSED (+ EDE 18)
 	4. Name on the blocklist                        → NXDOMAIN
 	5. Cached answer                                → served from cache
 	6. Otherwise                                    → forwarded upstream (encrypted)
+	7. Answer (from 5 or 6) outside the allowlist
+	   or qtypes                                    → REFUSED (+ EDE 18)
 
 So with both enabled:
 

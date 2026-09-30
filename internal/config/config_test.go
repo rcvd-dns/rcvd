@@ -110,13 +110,45 @@ func TestValidatePort53Loopback(t *testing.T) {
 
 // TestValidatePort53NonLoopback checks that port 53 on a non-loopback address is rejected.
 func TestValidatePort53NonLoopback(t *testing.T) {
-	for _, addr := range []string{"0.0.0.0:53", "192.0.2.1:53"} {
+	for _, addr := range []string{
+		"0.0.0.0:53", "192.0.2.1:53", "[::]:53",
+		":53",            // empty host binds every interface
+		"0:53",           // Go binds "0" as 0.0.0.0
+		"0.0.0.0:053",    // leading zero is still port 53
+		"0.0.0.0:domain", // service name for 53
+		"localhost:53",   // hostnames are not accepted on 53; use a loopback IP
+	} {
 		cfg := &Config{
 			Resolver:  ResolverConfig{Enabled: true, Listen: addr},
 			Upstreams: []UpstreamServer{{Name: "Test", Host: "dns.adguard.com", Port: 853, DoQ: true}},
 		}
 		if err := cfg.Validate(); err == nil {
 			t.Errorf("non-loopback port 53 %q should be rejected", addr)
+		}
+	}
+}
+
+// TestValidateListenHostMustBeIP checks that every listen field rejects hostnames, which
+// Go would resolve (in cleartext) at bind time, and accepts IP literals and empty hosts.
+func TestValidateListenHostMustBeIP(t *testing.T) {
+	up := []UpstreamServer{{Name: "Test", Host: "dns.adguard.com", Port: 853, DoQ: true}}
+	bad := []string{"localhost:5300", "dns.example.com:853", "0:5300", "127.0.0.1", "127.0.0.1:"}
+	for _, addr := range bad {
+		for name, cfg := range map[string]*Config{
+			"listen":     {Resolver: ResolverConfig{Enabled: true, Listen: addr}, Upstreams: up},
+			"listen_doh": {UpstreamService: UpstreamConfig{Enabled: true, ListenDoH: addr}, Upstreams: up},
+			"listen_dot": {UpstreamService: UpstreamConfig{Enabled: true, ListenDoT: addr}, Upstreams: up},
+			"listen_doq": {UpstreamService: UpstreamConfig{Enabled: true, ListenDoQ: addr}, Upstreams: up},
+			"metrics":    {Resolver: ResolverConfig{Enabled: true}, Metrics: MetricsConfig{Listen: addr}, Upstreams: up},
+		} {
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), addr) {
+				t.Errorf("%s %q should be rejected, got %v", name, addr, err)
+			}
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:5300", "[::1]:5300", ":5300", "0.0.0.0:5300", "[fe80::1%lo]:5300"} {
+		if err := validateListenAddr(addr); err != nil {
+			t.Errorf("%q should be accepted: %v", addr, err)
 		}
 	}
 }
@@ -721,5 +753,27 @@ files = ["/etc/rcvd/allowlist.txt"]
 `
 	if _, err := Load(writeTempConfig(t, body)); err != nil {
 		t.Errorf("dual-mode + allowlist should load, got: %v", err)
+	}
+}
+
+// TestAllowlistQTypeCodes: names map to wire codes case-insensitively; unknown and
+// duplicate names fail validation.
+func TestAllowlistQTypeCodes(t *testing.T) {
+	a := AllowlistConfig{QTypes: []string{"a", "AAAA", "Cname"}}
+	codes, err := a.QTypeCodes()
+	if err != nil {
+		t.Fatalf("QTypeCodes: %v", err)
+	}
+	if len(codes) != 3 || codes[0] != 1 || codes[1] != 28 || codes[2] != 5 {
+		t.Errorf("codes = %v, want [1 28 5]", codes)
+	}
+	if codes, err := (AllowlistConfig{}).QTypeCodes(); err != nil || codes != nil {
+		t.Errorf("empty: got %v, %v", codes, err)
+	}
+	for _, bad := range [][]string{{"A", "BOGUS"}, {"A", "a"}} {
+		c := &Config{Allowlist: AllowlistConfig{Enabled: true, Mode: "default-deny", Files: []string{"x"}, QTypes: bad}}
+		if err := c.validateAllowlist(); err == nil {
+			t.Errorf("%v: want validation error", bad)
+		}
 	}
 }

@@ -298,6 +298,7 @@ func (d *DOHListener) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 			if d.stats != nil {
 				atomic.AddInt64(&d.stats.CacheHits, 1)
 			}
+			cached = d.policy.Answer(query, cached)
 			// Normalize EDNS0 to the client's DO request (Issue 28).
 			ensureResponseEDNS(cached, query)
 			d.writeResponse(w, cached, servedStart)
@@ -356,6 +357,8 @@ func (d *DOHListener) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 	if d.cache != nil && len(query.Question) > 0 && response.Rcode == dns.RcodeSuccess {
 		d.cache.Put(query, response)
 	}
+	// Serve-time answer check, after the cache write (see policy.Answer).
+	response = d.policy.Answer(query, response)
 
 	// Normalize EDNS0 so a validating client does not downgrade (Issue 28).
 	ensureResponseEDNS(response, query)

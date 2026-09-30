@@ -477,6 +477,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 			}
 			// Cache hit: return cached response with original query ID
 			cached.Id = query.Id
+			cached = s.policy.Answer(query, cached)
 			// Normalize EDNS0 to this client's DO request (the cache key already
 			// separates DO/non-DO entries, but re-assert OPT+bufsize for Issue 28).
 			ensureResponseEDNS(cached, query)
@@ -534,6 +535,9 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 			s.cache.Put(query, response)
 		}
 	}
+	// Answer-section allowlist check runs at serve time, after the cache write, so the
+	// cache holds the raw upstream reply and an allowlist reload applies to it at once.
+	response = s.policy.Answer(query, response)
 
 	// Normalize EDNS0 on the outgoing reply (OPT present, DO matches the client's
 	// request, standard bufsize) so a validating stub resolver does not downgrade
@@ -686,7 +690,7 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 					atomic.AddInt64(&s.stats.CacheHits, 1)
 				}
 				cached.Id = query.Id
-				response = cached
+				response = s.policy.Answer(query, cached)
 			}
 		}
 
@@ -723,6 +727,8 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 					s.cache.Put(query, response)
 				}
 			}
+			// Serve-time answer check; see the UDP path.
+			response = s.policy.Answer(query, response)
 		}
 
 		// Normalize EDNS0 on the outgoing reply (covers blocklist NXDOMAIN, cache
