@@ -27,7 +27,7 @@ OUTPUT="${OUTPUT:-rcvd-amd64}"
 
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w -X main.buildDate=${BUILD_DATE}" \
     -o "${OUTPUT}" \
     ./cmd/rcvd
