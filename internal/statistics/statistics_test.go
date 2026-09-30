@@ -112,8 +112,8 @@ func TestRecordMode2Latency(t *testing.T) {
 func TestLatencyTimersAreIndependent(t *testing.T) {
 	s := New()
 
-	s.RecordLatency(5000)      // Mode-1 upstream fetch (a slow WAN miss)
-	s.RecordMode2Latency(3)    // Mode-2 client-facing (a fast cache hit)
+	s.RecordLatency(5000)   // Mode-1 upstream fetch (a slow WAN miss)
+	s.RecordMode2Latency(3) // Mode-2 client-facing (a fast cache hit)
 
 	snap := s.TakeSnapshot(0, 0, InstanceInfo{})
 	if snap.LatencyAvgUs != 5000 {

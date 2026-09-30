@@ -16,10 +16,10 @@ import (
 
 // Blocklist holds a set of blocked domains with wildcard support.
 type Blocklist struct {
-	domains map[string]bool // plain domains: example.com
+	domains  map[string]bool // plain domains: example.com
 	wildcard map[string]bool // wildcard domains: *.example.com
-	mu      sync.RWMutex
-	enabled bool
+	mu       sync.RWMutex
+	enabled  bool
 }
 
 // New creates a new blocklist.

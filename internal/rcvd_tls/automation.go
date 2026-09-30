@@ -3,7 +3,7 @@
 // It uses certmagic (Apache 2.0) for automatic ACME certificate management,
 // enabling production-ready DoH/DoT/DoQ without manual cert setup.
 //
-// How rcvd diverges from certmagic's Caddy defaults
+// # How rcvd diverges from certmagic's Caddy defaults
 //
 // certmagic is written primarily for Caddy — a public-facing web server whose job is to
 // terminate TLS for many on-demand domains and stay up no matter what. rcvd is a privacy

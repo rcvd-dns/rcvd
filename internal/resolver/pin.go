@@ -14,14 +14,14 @@ import (
 //
 // https://curl.se/docs/manpage.html#--pinnedpubkey
 // The double-slash prefix is the format defined by curl's --pinnedpubkey flag
-// and adopted as a de-facto standard alongside RFC 7469 
-// (HTTP Public Key Pinning / HPKP). The algorithm name ("sha256") is separated 
-// from the base64 value by "//". rcvd uses the same format so pins generated 
-// with `curl --pinnedpubkey` or openssl are directly usable in rcvd config without 
+// and adopted as a de-facto standard alongside RFC 7469
+// (HTTP Public Key Pinning / HPKP). The algorithm name ("sha256") is separated
+// from the base64 value by "//". rcvd uses the same format so pins generated
+// with `curl --pinnedpubkey` or openssl are directly usable in rcvd config without
 // conversion.
 //
-// The pin is a SHA-256 over the peer LEAF certificate's DER-encoded SubjectPublicKeyInfo 
-// i.e. it binds to the KEY, not the whole certificate, so a server may re-issue its 
+// The pin is a SHA-256 over the peer LEAF certificate's DER-encoded SubjectPublicKeyInfo
+// i.e. it binds to the KEY, not the whole certificate, so a server may re-issue its
 // cert (new dates/SANs) with the SAME keypair and the pin stays stable.
 //
 // SECURITY POSTURE — READ BEFORE TOUCHING pinnedTLSConfig BELOW.
@@ -47,10 +47,10 @@ import (
 //     (SHA-256) — a truncated/empty pin cannot accidentally match.
 //
 // https://owasp.org/www-community/controls/Certificate_and_Public_Key_Pinning
-// OWASP discourages pinning in general but that targets the WEB/HPKP case 
-// (different parties, TOFU (Trust On First Use), rotation lockout). 
-// Ours is the carve-out: same party controls both ends, SPKI pin over a stable 
-// self-signed cert, no TOFU — the pin is provisioned out-of-band in config), 
+// OWASP discourages pinning in general but that targets the WEB/HPKP case
+// (different parties, TOFU (Trust On First Use), rotation lockout).
+// Ours is the carve-out: same party controls both ends, SPKI pin over a stable
+// self-signed cert, no TOFU — the pin is provisioned out-of-band in config),
 // fail-closed by design — pinning fits here.
 //
 

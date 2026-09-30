@@ -7,8 +7,8 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"math"
 	"net"
@@ -179,11 +179,11 @@ func probeDoH(ctx context.Context, host, dialHost string, port int) (*UpstreamRe
 // buildResult constructs an UpstreamResult from a tls.ConnectionState.
 func buildResult(protocol, host string, port int, state tls.ConnectionState) *UpstreamResult {
 	result := &UpstreamResult{
-		Host:       host,
-		Port:       port,
-		Protocol:   protocol,
-		Success:    true,
-		TLSVersion: tls.VersionName(state.Version),
+		Host:        host,
+		Port:        port,
+		Protocol:    protocol,
+		Success:     true,
+		TLSVersion:  tls.VersionName(state.Version),
 		CipherSuite: tls.CipherSuiteName(state.CipherSuite),
 	}
 

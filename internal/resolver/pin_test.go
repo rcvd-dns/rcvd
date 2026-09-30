@@ -85,7 +85,7 @@ func TestParsePin(t *testing.T) {
 		{"no prefix", "AAAA"},
 		{"wrong prefix", "sha1//AAAA"},
 		{"bad base64", config.PinPrefix + "!!!not-base64!!!"},
-		{"too short", config.PinPrefix + "AAAA"},                                       // decodes to 3 bytes
+		{"too short", config.PinPrefix + "AAAA"},                                        // decodes to 3 bytes
 		{"too long", config.PinPrefix + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}, // >32 bytes
 	}
 	for _, tc := range bad {

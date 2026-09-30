@@ -48,8 +48,8 @@ type State int
 
 const (
 	StateUP   State = iota // Upstream is responding normally
-	StateSLOW             // Upstream is slow (above threshold)
-	StateDOWN             // Upstream is down (failed health check)
+	StateSLOW              // Upstream is slow (above threshold)
+	StateDOWN              // Upstream is down (failed health check)
 )
 
 // UpstreamState tracks health metrics for a single upstream
@@ -74,11 +74,11 @@ type FallbackResolver struct {
 	stats     *statistics.Stats // may be nil; only UpstreamFallbacks is bumped here
 
 	// Phase tracking
-	startTime      time.Time
+	startTime       time.Time
 	phase1DurationS int
 
 	// Health check settings
-	healthCheckIntervalS int
+	healthCheckIntervalS   int
 	phase2FailureThreshold int
 
 	// Synchronization
@@ -86,7 +86,7 @@ type FallbackResolver struct {
 
 	// Health check ticker
 	healthTicker *time.Ticker
-	stopChan    chan struct{}
+	stopChan     chan struct{}
 }
 
 // NewFallbackResolver creates a resolver with fallback across multiple upstreams.
@@ -107,7 +107,7 @@ func NewFallbackResolver(upstreams []*UpstreamState, logger *log.Logger, stats *
 		phase1DurationS:        phase1DurationS,
 		phase2FailureThreshold: phase2FailureThreshold,
 		healthCheckIntervalS:   healthCheckIntervalS,
-		stopChan:              make(chan struct{}),
+		stopChan:               make(chan struct{}),
 	}
 }
 
@@ -278,7 +278,7 @@ func (f *FallbackResolver) performHealthChecks() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		testMsg := &dns.Msg{
 			MsgHdr: dns.MsgHdr{
-				Id: 0,
+				Id:               0,
 				RecursionDesired: true,
 			},
 		}
