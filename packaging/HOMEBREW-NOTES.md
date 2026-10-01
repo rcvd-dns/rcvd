@@ -5,8 +5,8 @@ directly shapes the macOS install/UX story. This note tracks Homebrew release ch
 how rcvd is distributed and installed. Pairs with the launchd service files in `packaging/launchd/`
 and `Notes/MacOS-26-ARM-notes.md`.
 
-> Status: forward-looking. This is planning so the eventual formula +
-> tap are built against current Homebrew behavior, not stale assumptions.
+> Status: formula written and tested (v0.3.0); tap not yet published. These notes keep the
+> formula and tap aligned with current Homebrew behavior, not stale assumptions.
 
 ---
 
@@ -66,9 +66,14 @@ macOS 26 ARM notes. No direct formula impact yet.
   `net.core.*`) — see the launchd plist comments + `Notes/MacOS-26-ARM-notes.md`.
 
 ## Action checklist (when rcvd is ready to publish on Homebrew)
-- [ ] Decide: self-hosted tap (untrusted-by-default → document trust) vs. homebrew-core (trusted).
+- [x] Decide: self-hosted tap. homebrew-core needs 90 forks, 90 watchers or 225 stars for a
+  self-submission (https://docs.brew.sh/Package-Acceptance-Policy); revisit when that is met.
+- [x] One formula for macOS and Linux: `packaging/homebrew/rcvd.rb` (a tap holds a single
+  `Formula/rcvd.rb`). Published copy goes in the `rcvd-dns/homebrew-rcvd` repo.
+- [x] Formula uses Homebrew prefix helpers (`etc`, `var`, `opt_bin`), never hardcoded paths.
+- [x] Tested v0.3.0: Linuxbrew (Homebrew 7.0) and macOS 26.6 Intel, build + audit clean.
 - [ ] Write copy-pasteable macOS install incl. the **tap-trust** step for 6.0.0+ users.
-- [ ] Formula uses `HOMEBREW_PREFIX` (Intel `/usr/local` vs ARM `/opt/homebrew`).
-- [ ] Reconcile launchd plist paths with the chosen prefix (add ARM `/opt/homebrew` variant if needed).
+- [ ] `packaging/launchd/*.plist` are for manual installs only (`brew services` generates its own);
+  they hardcode `/usr/local`, so add an ARM `/opt/homebrew` note or variant.
 - [ ] Test install on macOS 26 (ARM) AND macOS 27 (Golden Gate).
 - [ ] If a Brewfile is offered, mark the rcvd tap `trusted:` and verify `brew bundle` flow.
