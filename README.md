@@ -190,7 +190,7 @@ supported OS/arch are produced by the CI pipeline.
 make test      # or: go test ./...
 ```
 
-Developed and run on Linux and NetBSD. Binaries for macOS and FreeBSD are
+Developed and run on Linux, NetBSD, and macOS 26 (Intel). FreeBSD binaries are
 cross-compiled from the same pure-Go source but have not yet been runtime-tested.
 
 ## Deployment Notes
@@ -201,8 +201,10 @@ always-on router and roaming-laptop deployments, are covered in
 
 ## Packaging
 
-Service units and platform packaging (OpenRC, systemd, launchd, Homebrew) live
-under [`packaging/`](packaging/) — see the packaging directory for full details.
+Service units and platform packaging (OpenRC, systemd, launchd) live
+under [`packaging/`](packaging/). See that directory for full details.
+
+Homebrew (macOS and Linux): https://github.com/rcvd-dns/homebrew-rcvd
 
 ## Pre-Release Development History
 - see HISTORY.md
