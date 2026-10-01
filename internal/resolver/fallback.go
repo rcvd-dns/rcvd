@@ -87,6 +87,7 @@ type FallbackResolver struct {
 	// Health check ticker
 	healthTicker *time.Ticker
 	stopChan     chan struct{}
+	closeOnce    sync.Once
 }
 
 // NewFallbackResolver creates a resolver with fallback across multiple upstreams.
@@ -337,21 +338,25 @@ func (f *FallbackResolver) GetStatus() map[string]map[string]interface{} {
 	return status
 }
 
-// Close stops health checks and closes all resolver connections
+// Close stops health checks and closes all resolver connections. It is safe to
+// call more than once: the server's Stop and main's shutdown path both close the
+// chain, and a second close(stopChan) would panic.
 func (f *FallbackResolver) Close() error {
-	close(f.stopChan)
+	f.closeOnce.Do(func() {
+		close(f.stopChan)
 
-	f.mu.Lock()
-	if f.healthTicker != nil {
-		f.healthTicker.Stop()
-	}
-
-	for _, upstream := range f.upstreams {
-		if upstream.Resolver != nil {
-			upstream.Resolver.Close()
+		f.mu.Lock()
+		if f.healthTicker != nil {
+			f.healthTicker.Stop()
 		}
-	}
-	f.mu.Unlock()
+
+		for _, upstream := range f.upstreams {
+			if upstream.Resolver != nil {
+				upstream.Resolver.Close()
+			}
+		}
+		f.mu.Unlock()
+	})
 
 	return nil
 }
