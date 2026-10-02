@@ -25,6 +25,7 @@ type mockResolver struct {
 	failing    bool
 	answerName string
 	calls      int64
+	closes     int64
 }
 
 func (m *mockResolver) setFailing(v bool) {
@@ -50,7 +51,7 @@ func (m *mockResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, err
 	return resp, nil
 }
 
-func (m *mockResolver) Close() error { return nil }
+func (m *mockResolver) Close() error { atomic.AddInt64(&m.closes, 1); return nil }
 
 func testQuery() *dns.Msg {
 	m := new(dns.Msg)
@@ -295,5 +296,26 @@ func TestFallbackRejectsMalformedQDCOUNT(t *testing.T) {
 	}
 	if s := f.GetStatus()["only"]["state"]; s != "UP" {
 		t.Errorf("healthy upstream penalized for a malformed client query: state %v", s)
+	}
+}
+
+// TestFallbackCloseTwice: shutdown closes the chain from both the server's Stop
+// and main, so a second Close must be a no-op instead of panicking on
+// close(stopChan), and each upstream is closed exactly once.
+func TestFallbackCloseTwice(t *testing.T) {
+	up := &mockResolver{}
+	f := NewFallbackResolver([]*UpstreamState{
+		{Name: "primary", Resolver: up},
+	}, discardLogger(), nil, 300, 3, 30)
+	f.Start()
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if got := atomic.LoadInt64(&up.closes); got != 1 {
+		t.Errorf("upstream closes: expected 1, got %d", got)
 	}
 }
