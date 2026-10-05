@@ -148,11 +148,12 @@ doh = false                     # DNS-over-HTTPS (RFC 8484)
 # DoH-specific
 doh_path = "/dns-query"         # HTTP path (only if doh = true)
 
-# Optional: Public key pinning
-pinned_pubkey = "..."           # Hex-encoded SPKI hash (deferred)
+# Optional: SPKI public-key pin for a self-signed upstream leg
+pinned_pubkey = "sha256//..."   # leaf SubjectPublicKeyInfo pin; see -show-pin / -verify-pin
 
-# Optional: 0-RTT session resumption (PRIVACY TRADEOFF — see below)
-quic_0rtt = false               # Enable QUIC 0-RTT (default: false, privacy-first) — not yet implemented
+# Note: there is no 0-RTT option. rcvd never sends QUIC 0-RTT early data
+# (enforced in code); it uses 1-RTT session resumption. See the QUIC 0-RTT
+# section below.
 ```
 
 **Options:**
@@ -164,7 +165,7 @@ quic_0rtt = false               # Enable QUIC 0-RTT (default: false, privacy-fir
 - `dot` (bool, optional) — Enable DNS-over-TLS (RFC 7858)
 - `doh` (bool, optional) — Enable DNS-over-HTTPS (RFC 8484)
 - `doh_path` (string, optional) — HTTP path for DoH (default: `/dns-query`)
-- `quic_0rtt` (bool, optional) — Enable QUIC 0-RTT (see QUIC 0-RTT section below) — **not yet implemented**
+- `pinned_pubkey` (string, optional) — SPKI pin (`sha256//BASE64`) of the upstream's leaf public key, for a self-signed encrypted leg between two rcvd instances; the chain is authenticated by the pin, not a CA. Generate with `-show-pin`, audit with `-verify-pin`.
 
 **Multiple Upstreams:**
 
@@ -284,83 +285,37 @@ RCVD attempts DoQ. If the connection fails, it retries with DoT on the next quer
 
 ---
 
-## QUIC 0-RTT: Speed vs. Privacy Tradeoff
+## QUIC 0-RTT: Never Enabled (Not Configurable)
 
-### What is 0-RTT?
+**rcvd never uses QUIC 0-RTT early data. This is enforced in code, not a setting** — there is no
+`quic_0rtt` knob. You cannot turn it on, by design.
 
-**0-RTT** (Zero Round Trip Time) is QUIC's session resumption feature. It controls **when and how often** cryptographic handshakes occur:
+**What 0-RTT is.** QUIC 0-RTT lets a client send application data (here, a DNS query) in the very
+first flight of a *resumed* connection, before the handshake completes. It saves a round trip on
+repeat connections, but it carries two costs rcvd refuses:
 
-**Handshake Timeline:**
+- **Replay (RFC 9250 §7.1).** 0-RTT early data is replayable by a network attacker. For a resolver,
+  that is a correctness and security hazard, so rcvd declines early data entirely.
+- **Linkability (RFC 9250 §7.2).** Resumption tokens let an upstream correlate repeat connections to
+  the same client, weakening query anonymity.
 
-| Connection | 0-RTT Disabled | 0-RTT Enabled |
-|-----------|----------------|---------------|
-| **1st connection** | Full handshake (1 RTT) | Full handshake (1 RTT) |
-| **2nd+ connections** | Full handshake every time (1 RTT each) | Reuse session keys (0 RTT) |
-| **Handshake frequency** | Every query | Only on first connection |
+**What rcvd does instead.** rcvd uses **1-RTT TLS session resumption** — a persistent
+`tls.ClientSessionCache`, re-dialing with a resumed session but completing the 1-RTT handshake before
+any query is sent (`quic.DialAddr`, never `DialEarly`). This recovers most of the repeat-connection
+speed of a warm session **without** sending replayable early data. So the practical tradeoff is
+you get fast resumption and no 0-RTT replay exposure.
 
-**Speed comparison:**
-- **0-RTT disabled:** Every connection requires a full cryptographic handshake (slower, more private)
-- **0-RTT enabled:** First connection has handshake, repeat connections reuse session keys (faster, less private)
+rcvd accepts the RFC 9250 §7.2 linkability of 1-RTT resumption and refuses the §7.1 replay of 0-RTT.
 
-**Privacy cost:**
-- When 0-RTT is enabled, the upstream server can link multiple queries to the same client session
-- The server sees: "Query A, Query B, and Query C all came from the same client"
-- This breaks query anonymity (potential privacy issue)
+> Background: the QUIC 0-RTT / session-linkability tradeoff is documented in the original QUIC
+> protocol paper (Google QUIC Transport Protocol, SIGCOMM '17, August 2017): QUIC combines the
+> cryptographic and transport layers and uses 0-RTT handshakes for repeat connections to the same
+> origin, which is exactly the connection-reuse-vs-anonymity choice above. rcvd makes that choice at
+> the safe end, in code, rather than exposing it as an operator configuration choice.
 
-### Default Configuration
-
-RCVD defaults to **`quic_0rtt = false`** (privacy-first):
-
-```toml
-[resolver]
-enabled = true
-listen = "127.0.0.1:5300"
-
-[[upstreams]]
-name = "AdGuard DoQ"
-host = "dns.adguard.com"
-port = 853
-doq = true
-quic_0rtt = false  # Default: privacy over speed
-```
-
-Each new connection uses a fresh session (slower, more private).
-
-### Enabling 0-RTT for Speed
-
-If you prioritize speed over anonymity (e.g., internal corporate resolver), enable 0-RTT:
-
-```toml
-[[upstreams]]
-name = "AdGuard DoQ"
-host = "dns.adguard.com"
-port = 853
-doq = true
-quic_0rtt = true   # Enable session resumption (faster, less private)
-```
-
-**When to enable `quic_0rtt = true`:**
-- Internal corporate networks (queries are already known to your organization)
-- Low-latency, high-throughput scenarios where privacy is less critical
-- Environments where the upstream provider is fully trusted
-
-**When to keep `quic_0rtt = false`:**
-- Public-facing resolvers (privacy is paramount)
-- Scenarios where upstream providers are not fully trusted
-- When anonymity between queries matters
-- Default for privacy-first deployments
-
-### Technical Note: QUIC 0-RTT in Academic Literature
-
-The tradeoff between 0-RTT performance and session linkability is well-documented in the original QUIC protocol paper:
-
-> "A common load balancing method employed by servers is to use multiple IP addresses for the same hostname, and repeat TCP connections to the same domain may end up at different server IP addresses. Since QUIC combines the cryptographic layer with transport, it uses 0-RTT handshakes with repeat connections to the same origin."
->
-> — Google QUIC Transport Protocol, SIGCOMM '17 (August 2017), Page 13
-
-This highlights the fundamental design choice: QUIC prioritizes connection reuse (0-RTT) for performance, which enables servers to link multiple queries to the same client session. RCVD makes this choice configurable rather than mandatory, allowing administrators to prioritize privacy when needed.
-
-**RFC 9250 (DNS-over-QUIC)** acknowledges this in Section 5.2, recommending session resumption but not mandating it. RCVD respects this by making it configurable. The privacy implications are yours to evaluate.
+**RFC 9250 (DNS-over-QUIC)** §5.2 recommends session resumption but does not mandate 0-RTT. rcvd
+follows this with 1-RTT resumption and no 0-RTT early data, fixed in code rather than left to
+configuration.
 
 ---
 
@@ -990,27 +945,7 @@ health_check_interval_s = 30
 level = "info"
 ```
 
-### Example 3: Speed-Optimized (0-RTT Enabled)
-
-```toml
-[resolver]
-enabled = true
-listen = "127.0.0.1:5300"
-
-[[upstreams]]
-name = "AdGuard DoQ (Fast)"
-host = "dns.adguard.com"
-port = 853
-doq = true
-quic_0rtt = true  # Enable session resumption for speed
-
-[logging]
-level = "info"
-```
-
-Use in environments where speed matters more than per-query anonymity.
-
-### Example 4: Privacy-Maximized (0-RTT Disabled, No Query Logging)
+### Example 3: Privacy-Maximized (No Query Logging)
 
 ```toml
 stats_enabled = true
@@ -1024,7 +959,6 @@ name = "AdGuard DoQ (Private)"
 host = "dns.adguard.com"
 port = 853
 doq = true
-quic_0rtt = false  # Explicit: privacy-first (default)
 
 [cache]
 enabled = true
@@ -1201,8 +1135,8 @@ Start both: `systemctl start rcvd-internal rcvd-upstream`
 
 This design ensures:
 - ✅ Users understand their configuration before deploying
-- ✅ No accidental misconfigurations (e.g., 0-RTT enabled unintentionally)
-- ✅ Admins can evaluate tradeoffs (speed vs. privacy) for their use case
+- ✅ No accidental misconfigurations (e.g., an upstream left on a weaker transport by default)
+- ✅ Admins can evaluate upstream, cache, and DNSSEC tradeoffs for their use case
 - ✅ No hidden defaults that may not suit all scenarios
 
 **Recommendation:** Start with Example 1 (Simple Resolver) and customize as needed.
