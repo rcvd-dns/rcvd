@@ -201,8 +201,8 @@ always-on router and roaming-laptop deployments, are covered in
 
 ## Packaging
 
-Service units and platform packaging (OpenRC, systemd, launchd) live
-under [`packaging/`](packaging/). See that directory for full details.
+Service units (OpenRC, systemd, launchd) and distro package recipes (AUR, Nix,
+NetBSD pkgsrc) live in https://github.com/rcvd-dns/packaging
 
 Homebrew (macOS and Linux): https://github.com/rcvd-dns/homebrew-rcvd
 

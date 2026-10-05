@@ -154,8 +154,8 @@ worth knowing about.
 
 **Recommended mitigation:** run RCVD under a service manager with automatic
 restart — e.g. a systemd unit with `Restart=on-failure` — so it recovers
-cleanly across network transitions. See [`packaging/`](../packaging/) for the
-service units.
+cleanly across network transitions. Service units (systemd, OpenRC, launchd)
+live in https://github.com/rcvd-dns/packaging
 
 The log noise on laptops is cosmetic and does not indicate DNS failure.
 
