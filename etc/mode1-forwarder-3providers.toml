@@ -30,7 +30,7 @@ listen = "127.0.0.1:5300"
 
 # ── Upstream chain: tried in order. First that answers wins; failures fall through. ───────
 #
-# ★ BOOTSTRAP HARDENING — pin `ip` on every upstream. Without it, RCVD must resolve the
+#   BOOTSTRAP HARDENING — pin `ip` on every upstream. Without it, RCVD must resolve the
 #   upstream's hostname (e.g. dns.adguard.com) to get a dial target, and that first lookup
 #   can only go out as CLEARTEXT DNS — the exact leak RCVD exists to prevent. Setting `ip`
 #   makes the dial target explicit so there is ZERO cleartext bootstrap. `host` is still
@@ -65,7 +65,13 @@ host = "dns.quad9.net"
 # ip = "change-me"                  # e.g. 9.9.9.9 — pin to avoid cleartext bootstrap
 port = 443
 doh = true
-doh_path = "/dns-query"
+# doh_path is OPTIONAL and usually not required.
+# doh_path = "/dns-query"
+# it defaults to "/dns-query" (RFC 8484) when omitted, which is what
+# the major providers use, so you can typically expect to leave this line out entirely.
+# Set it only to point at a server that serves DoH on a non-standard path.
+# The value is sent verbatim, so include the leading "/" and match exactly
+# what the upstream expects (a trailing slash is not normalized).
 
 # ── DNSSEC validation (on by default; shown explicitly for clarity) ──────────────────────
 [dnssec]
@@ -89,7 +95,8 @@ phase2_failure_threshold = 3      # runtime: consecutive failures before an upst
 phase2_slow_threshold_ms = 200    # informational SLOW threshold
 health_check_interval_s = 30      # how often DOWN upstreams are re-probed for recovery
 
-# ── Logging (stderr by default; set a file path or "stdout" for containers) ──────────────
+# ── Logging (defaults to the file /var/log/rcvd/rcvd.log when `file` is unset; set
+# file = "stdout" for containers, or any other path to log elsewhere) ─────────────────────
 [logging]
 level = "info"
 format = "text"

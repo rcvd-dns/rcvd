@@ -4,6 +4,7 @@
 - [Mode 1 — Encrypting Forwarder](#mode-1)
 - [Mode 2 — Encrypted DNS Server](#mode-2)
 - [Blocklist](#blocklist)
+- [Allowlist (Default-Deny)](#allowlist-default-deny)
 - [Cache](#cache)
 - [Statistics](#statistics)
 - [DNSSEC](#dnssec)
@@ -49,7 +50,35 @@ main.go:239: blocklist: loaded /etc/rcvd/domainswild
 
 The `Blocklist` section in `rcvd --stats` only appears after loading completes. Its presence is confirmation that filtering is active.
 
+Reload a changed blocklist live with `rcvd --blocklist-reload` — the swap is asynchronous (adds and removes apply without a restart) and statistics are preserved across it.
+
 Validated on Alpine aarch64 (SD-card storage) with a 328K-entry blocklist (~60s load time from slow media).
+
+## Allowlist (Default-Deny)
+
+Where the blocklist denies a named set and permits everything else, the allowlist inverts that: when
+enabled in **default-deny** mode, **only** names under the suffixes you list resolve, and every other
+name is refused locally and never forwarded.
+
+A denied name returns **REFUSED** with **EDE 18 (Prohibited)** — not NXDOMAIN, which the blocklist
+uses — so the two filters stay distinguishable on the wire and in statistics. Denied queries are
+counted separately as **Denied (allowlist)** in `rcvd --stats`, kept clear of the blocklist's
+**Blocked (NXDOMAIN)** counter.
+
+Enforcement is identical in both Mode 1 and Mode 2. It runs through the shared internal policy
+layer, so the decision cannot be bypassed by switching transport (UDP/TCP for Mode 1, DoH/DoT/DoQ
+for Mode 2). Answer-section names and CNAME/DNAME targets are checked too, so a permitted name cannot
+smuggle in a disallowed one. When a name is both allowed and on the blocklist, the blocklist wins
+(NXDOMAIN).
+
+An optional `qtypes` list narrows the record types a query and its answers may carry (for example
+`["A", "AAAA"]`); left empty, any type is allowed.
+
+The allowlist is **fail-closed**: it loads before any listener starts, and a missing file, an invalid
+line, or an empty result is a startup error rather than a silently open resolver. Edit the files and
+apply them live with `rcvd --allowlist-reload`, which is synchronous — it reports success or failure
+and, on any error, leaves the previous list active so a bad edit can never widen or empty it. Names
+removed from the list are refused immediately, even if an answer for them is still cached.
 
 ## Cache
 

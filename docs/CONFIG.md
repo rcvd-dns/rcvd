@@ -164,7 +164,8 @@ pinned_pubkey = "sha256//..."   # leaf SubjectPublicKeyInfo pin; see -show-pin /
 - `doq` (bool, optional) — Enable DNS-over-QUIC (RFC 9250)
 - `dot` (bool, optional) — Enable DNS-over-TLS (RFC 7858)
 - `doh` (bool, optional) — Enable DNS-over-HTTPS (RFC 8484)
-- `doh_path` (string, optional) — HTTP path for DoH (default: `/dns-query`)
+- `doh_path` (string, optional) — HTTP path for DoH (default: `/dns-query`). Sent verbatim, so
+  include the leading `/` and match the upstream exactly; a trailing slash is not normalized.
 - `pinned_pubkey` (string, optional) — SPKI pin (`sha256//BASE64`) of the upstream's leaf public key, for a self-signed encrypted leg between two rcvd instances; the chain is authenticated by the pin, not a CA. Generate with `-show-pin`, audit with `-verify-pin`.
 
 **Multiple Upstreams:**
