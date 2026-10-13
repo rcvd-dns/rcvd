@@ -312,9 +312,12 @@ root trust anchor **embedded** in the binary (the public root KSK digest; no set
 system anchor (e.g. **/var/lib/unbound/root.key**) so the OS owns trust-anchor updates,
 including the rare root KSK rollover, which rcvd does not yet track automatically (RFC 5011).
 
-**[logging]** — **level** is **debug**, **info** (default), **warn**, or **error**. **format**
-is **text** (default) or **json**. **file** is the log destination: an explicit path, or the
-special values **stdout** or **stderr**. When unset it defaults to **/var/log/rcvd/rcvd.log**.
+**[logging]** — **level** is **debug**, **info** (default), **warn**, or **error**. Every log
+line carries an ISO 8601 / RFC 3339 timestamp in UTC; **timestamp** sets the fractional
+precision, one of **second** (default), **ms**, or **us**. rcvd logs in text only; a **format**
+key other than **text** (e.g. **json**) is rejected at startup. **file** is the log destination:
+an explicit path, or the special values **stdout** or **stderr**. When unset it defaults to
+**/var/log/rcvd/rcvd.log**.
 
 **stats_enabled** — Set to **true** to enable the Unix socket for **-stats**, **-audit**,
 **-blocklist-reload**, and **-allowlist-reload**. With it off, none of these can reach the daemon.

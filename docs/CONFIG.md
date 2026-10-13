@@ -708,9 +708,18 @@ Latency
 ```toml
 [logging]
 level = "info"                 # Log level (default: "info")
-format = "text"                # Log format (default: "text")
+timestamp = "second"           # Timestamp precision (default: "second")
 file = "/var/log/rcvd/rcvd.log" # Log destination (default: /var/log/rcvd/rcvd.log)
 ```
+
+Every log line carries an ISO 8601 / RFC 3339 timestamp in UTC, for example:
+
+```
+2026-10-10T14:22:07Z main.go:295: starting RCVD 0.3.1
+```
+
+The timestamp is always UTC and always ISO 8601 (greppable and sortable by date);
+only the fractional precision is configurable.
 
 **Options:**
 - `file` (string, optional) — Log destination
@@ -727,10 +736,19 @@ file = "/var/log/rcvd/rcvd.log" # Log destination (default: /var/log/rcvd/rcvd.l
     - **What IS NOT logged at `info`:** Individual DNS queries (never — queried names are never logged at any level), upstream health state changes, configuration details, protocol debug info
   - Use `"debug"` for upstream state machine details, health check activity, and protocol-level diagnostics
 
-- `format` (string, optional) — Log output format
-  - Options: `"text"`, `"json"`
-  - Default: `"text"` (human-readable, suitable for syslog and journalctl)
-  - Use `"json"` for structured logging to log aggregators (Elasticsearch, Splunk, etc.)
+- `timestamp` (string, optional) — Fractional precision of the per-line timestamp
+  - Options: `"second"`, `"ms"`, `"us"`
+  - Default: `"second"` — `2026-10-10T14:22:07Z`
+  - `"ms"` → `2026-10-10T14:22:07.123Z`, `"us"` → `2026-10-10T14:22:07.123456Z`
+  - Second precision suits the usual operational log; opt into `"ms"`/`"us"` when
+    correlating timing (e.g. protocol retries) or ordering events across logs
+
+> **No `format` option.** rcvd logs in text only. A `format` key set to `"json"`
+> (or any value other than `"text"`) is rejected at startup rather than silently
+> ignored, so a log aggregator is never fed text that was configured as JSON.
+
+**Containers:** set `file = "stdout"` so `podman logs` / `docker logs` capture output.
+rcvd already stamps each line, so skip `logs -t` (it prepends a second timestamp).
 
 ---
 
@@ -895,7 +913,7 @@ enabled = true
 
 [logging]
 level = "info"
-format = "text"
+timestamp = "second"
 ```
 
 Use with: `systemd-resolved` configured to forward to `127.0.0.1:5300`
@@ -980,7 +998,7 @@ level = "info"     # Logs startup/stop only (no query details, no upstream state
 Use for privacy-conscious deployments. Individual queries are never logged locally (RCVD has
 no query-logging facility by design), and startup/stop messages are minimal.
 
-**Note:** If you omit the `[logging]` section entirely, RCVD defaults to `level = "info"` and `format = "text"` anyway. You only need to specify `[logging]` if you want non-default behavior (e.g., `level = "debug"` for upstream state changes or `format = "json"`).
+**Note:** If you omit the `[logging]` section entirely, RCVD defaults to `level = "info"` and `timestamp = "second"` anyway. You only need to specify `[logging]` if you want non-default behavior (e.g., `level = "debug"` for upstream state changes, or `timestamp = "ms"` for sub-second precision).
 
 ---
 
