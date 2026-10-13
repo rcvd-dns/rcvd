@@ -34,13 +34,16 @@ import (
 // local build so that even a bare `go build ./cmd/rcvd` self-reports honestly.
 //
 //	version     — release version, normally the git tag (e.g. "0.1.0").
-//	              Default "0.3.0-dev" marks an untagged development build.
+//	              Release/CI and the local build scripts stamp it from
+//	              `git describe --tags` (e.g. "0.3.1-5-gc47fe48"). The "dev"
+//	              default is only ever seen for a bare `go build ./cmd/rcvd`
+//	              with no ldflags and no git (e.g. a distfile tarball).
 //	buildDate   — UTC build timestamp (RFC 3339), e.g. "2026-07-07T10:00:00Z".
 //	buildSource — what produced the binary: "local" (a developer machine),
 //	              "github-runner", "gitlab-runner", etc. Lets anyone inspect an
 //	              artifact and know its provenance.
 var (
-	version     = "0.3.0-dev"
+	version     = "dev"
 	buildDate   = "unknown"
 	buildSource = "local"
 )

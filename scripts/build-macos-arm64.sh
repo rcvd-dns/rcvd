@@ -4,11 +4,12 @@
 set -euo pipefail
 
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
 OUTPUT="${1:-rcvd-macos-arm64}"
 
 # macOS with arm64 architecture (Apple Silicon)
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath \
-    -ldflags "-s -w -X main.buildDate=${BUILD_DATE}" \
+    -ldflags "-s -w -X main.version=${VERSION} -X main.buildDate=${BUILD_DATE}" \
     -o "${OUTPUT}" \
     ./cmd/rcvd
 

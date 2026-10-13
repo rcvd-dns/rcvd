@@ -33,7 +33,7 @@ INSTALL    ?= install
 all: build
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.buildDate=$$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o $(BIN) ./cmd/rcvd
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev) -X main.buildDate=$$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o $(BIN) ./cmd/rcvd
 
 build-linux-amd64:
 	scripts/build-linux-amd64.sh
