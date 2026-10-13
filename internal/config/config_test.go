@@ -44,6 +44,50 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+// TestValidateLoggingFields checks the fail-closed logging knobs: format = "json"
+// (and any non-text value) is rejected rather than silently emitting text, and the
+// timestamp precision is restricted to second/ms/us. Empty values take defaults.
+func TestValidateLoggingFields(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Resolver:  ResolverConfig{Enabled: true, Listen: "127.0.0.1:5300"},
+			Upstreams: []UpstreamServer{{Name: "Test", Host: "1.1.1.1", Port: 853, DoQ: true}},
+		}
+	}
+
+	// format: only "text" (and empty -> default) are accepted.
+	for _, ok := range []string{"", "text"} {
+		cfg := base()
+		cfg.Logging.Format = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("format %q should pass: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"json", "JSON", "logfmt"} {
+		cfg := base()
+		cfg.Logging.Format = bad
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("format %q must be rejected at startup", bad)
+		}
+	}
+
+	// timestamp: second/ms/us (and empty -> default) accepted, anything else rejected.
+	for _, ok := range []string{"", "second", "ms", "us"} {
+		cfg := base()
+		cfg.Logging.Timestamp = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("timestamp %q should pass: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"nanos", "milli", "sec"} {
+		cfg := base()
+		cfg.Logging.Timestamp = bad
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("timestamp %q must be rejected", bad)
+		}
+	}
+}
+
 // TestConfigValidateNoUpstream checks that validation fails without upstreams.
 func TestConfigValidateNoUpstream(t *testing.T) {
 	cfg := &Config{

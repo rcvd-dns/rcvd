@@ -239,8 +239,14 @@ type MetricsConfig struct {
 // LoggingConfig — Application logging
 type LoggingConfig struct {
 	Level  string `toml:"level"`  // debug, info, warn, error (default: info)
-	Format string `toml:"format"` // text or json (default: text)
-	File   string `toml:"file"`   // optional: log file path (default: stderr if not set)
+	Format string `toml:"format"` // "text" only (default: text); "json" is not supported and is rejected at startup
+	// Timestamp precision on each log line: "second" (default), "ms", or "us".
+	// All lines are ISO 8601 / RFC 3339 UTC regardless; this controls the fractional
+	// digits only. Second is the default because sub-second precision is noise for
+	// the usual operational log; "ms"/"us" are there to opt into when correlating
+	// timing (e.g. DoQ idle re-dials) or ordering events across logs.
+	Timestamp string `toml:"timestamp"`
+	File      string `toml:"file"` // optional: log file path (default: stderr if not set)
 }
 
 // FallbackConfig — Protocol fallback state machine
@@ -765,6 +771,25 @@ func (c *Config) validate(requireToken bool) error {
 	}
 	if c.Logging.Format == "" {
 		c.Logging.Format = "text"
+	}
+	if c.Logging.Timestamp == "" {
+		c.Logging.Timestamp = "second"
+	}
+	// Fail closed on log settings that would otherwise be silently ignored.
+	// "json" in particular must not start: rcvd's log is text-only, so accepting
+	// format = "json" and emitting text anyway would feed an aggregator malformed
+	// data during an incident. Reject at startup instead.
+	switch c.Logging.Format {
+	case "text":
+	case "json":
+		return fmt.Errorf("logging.format %q is not supported — rcvd logs in text only", c.Logging.Format)
+	default:
+		return fmt.Errorf("logging.format %q is invalid (only \"text\" is supported)", c.Logging.Format)
+	}
+	switch c.Logging.Timestamp {
+	case "second", "ms", "us":
+	default:
+		return fmt.Errorf("logging.timestamp %q is invalid (want \"second\", \"ms\", or \"us\")", c.Logging.Timestamp)
 	}
 	// Default to /var/log/rcvd/rcvd.log if not specified (most deployments expect file logging).
 	// Use the special value file = "stdout" to log to standard output instead (container-friendly:

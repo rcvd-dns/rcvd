@@ -280,16 +280,16 @@ func main() {
 	case "stdout":
 		// Container-friendly: log to stdout so `podman logs` / `docker logs` and
 		// log aggregators capture output. No file handle to manage.
-		appLogger = logger.New(cfg.Logging.Level, os.Stdout)
+		appLogger = logger.New(cfg.Logging.Level, cfg.Logging.Timestamp, os.Stdout)
 	case "stderr", "":
-		appLogger = logger.New(cfg.Logging.Level, os.Stderr)
+		appLogger = logger.New(cfg.Logging.Level, cfg.Logging.Timestamp, os.Stderr)
 	default:
 		logFile, err = os.OpenFile(cfg.Logging.File, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: cannot open log file %s: %v\n", cfg.Logging.File, err)
 			os.Exit(1)
 		}
-		appLogger = logger.New(cfg.Logging.Level, logFile)
+		appLogger = logger.New(cfg.Logging.Level, cfg.Logging.Timestamp, logFile)
 	}
 
 	appLogger.Printf("starting RCVD %s — Resilient, Cryptographic, Verifiable DNS\n", displayVersion())

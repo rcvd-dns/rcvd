@@ -234,6 +234,7 @@ func (s *Service) setupTLS(fullConfig *config.Config) (*tls.Config, *rcvd_tls.Ma
 			Challenge:      fullConfig.TLSAutomation.Challenge,
 			DNSProvider:    fullConfig.TLSAutomation.DNSProvider,
 			DNSAPIToken:    fullConfig.TLSAutomation.DNSAPIToken,
+			LogTimestamp:   fullConfig.Logging.Timestamp,
 		}
 
 		manager, err := rcvd_tls.NewManager(automationCfg, s.logger)

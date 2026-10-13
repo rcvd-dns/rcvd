@@ -139,7 +139,7 @@ func TestStartupAllowlistMissingFileFails(t *testing.T) {
 			Files:   []string{allowPath},
 		},
 	}
-	discardLog := logger.New("info", io.Discard)
+	discardLog := logger.New("info", "second", io.Discard)
 	al, err := loadAllowlistAtStartup(cfg, discardLog)
 	if err == nil {
 		t.Fatal("expected error for missing allowlist file, got nil")
@@ -174,7 +174,7 @@ func TestStartupAllowlistEmptyFileFails(t *testing.T) {
 					Files:   []string{path},
 				},
 			}
-			discardLog := logger.New("info", io.Discard)
+			discardLog := logger.New("info", "second", io.Discard)
 			al, err := loadAllowlistAtStartup(cfg, discardLog)
 			if err == nil {
 				t.Fatal("expected error for empty allowlist, got nil")
@@ -206,7 +206,7 @@ func TestStartupAllowlistSuccess(t *testing.T) {
 			Files:   []string{path},
 		},
 	}
-	discardLog := logger.New("info", io.Discard)
+	discardLog := logger.New("info", "second", io.Discard)
 	al, err := loadAllowlistAtStartup(cfg, discardLog)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -243,7 +243,7 @@ doq = true
 	if err != nil {
 		t.Fatalf("config load: %v", err)
 	}
-	discardLog := logger.New("info", io.Discard)
+	discardLog := logger.New("info", "second", io.Discard)
 	al, err := loadAllowlistAtStartup(cfg, discardLog)
 	if err != nil {
 		t.Errorf("disabled allowlist: expected no error, got: %v", err)

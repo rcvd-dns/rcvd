@@ -59,7 +59,7 @@ func TestDoQClientRetriesStaleConnection(t *testing.T) {
 	// keep the conditional log-classification assertions below meaningful.
 	var logBuf bytes.Buffer
 	client := resolver.NewDoQResolver("localhost", "127.0.0.1", 18855, pin, nil)
-	client.SetLogger(logger.New("debug", &logBuf))
+	client.SetLogger(logger.New("debug", "second", &logBuf))
 	defer client.Close()
 
 	ask := func(name string) (*dns.Msg, error) {

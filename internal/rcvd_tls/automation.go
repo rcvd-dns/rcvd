@@ -20,7 +20,8 @@
 //     rcvd uses ManageSync so a bad ACME/DNS-01 config surfaces at startup, not at first query.
 //   - Logging is rcvd's, not certmagic's. certmagic logs through zap to stderr by default,
 //     which is lost under most init systems. rcvd bridges certmagic's zap logger into the
-//     rcvd log file so ACME issuance progress and errors are actually visible. See newZapLogger.
+//     rcvd log file so ACME issuance progress and errors are actually visible, and configures
+//     it for the same ISO 8601 / RFC 3339 timestamp rcvd uses everywhere. See newZapLogger.
 //   - Strict ALPN, no HTTP/1.1. The base tls.Config here advertises only "h2"; each Mode-2
 //     listener then pins its own transport ("doq"/"h2"/"h3"). rcvd never falls back to
 //     HTTP/1.1 the way a general web server might. See GetTLSConfig.
@@ -30,6 +31,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -44,24 +46,56 @@ import (
 	"github.com/rcvd-dns/rcvd/internal/config"
 )
 
-// newZapLogger builds a *zap.Logger that writes to the same io.Writer as the given
+// newZapLogger builds a *zap.Logger that writes to the same destination as the given
 // rcvd *log.Logger, so certmagic's internal (zap) output lands in the rcvd log file.
 // Level is INFO (certmagic's issuance progress + errors) with a compact console encoder.
 //
 // Divergence from certmagic's default (see the package doc): certmagic logs to its own zap
 // sink, which is fine for Caddy but disappears under an init system that only captures the
 // daemon's own log. Routing it here is what makes a stuck DNS-01 challenge diagnosable.
-func newZapLogger(l *log.Logger) *zap.Logger {
+//
+// Timestamps: zap emits its own ISO 8601 / RFC 3339 UTC timestamp at the same fractional
+// precision as rcvd's own logger (timestampPrecision: "second"/"ms"/"us"), so the whole file
+// is greppable by date and uses one format throughout. rcvd's logger stamps the time via a
+// wrapping writer (internal/logger.isoWriter); to avoid double-stamping certmagic lines, this
+// unwraps that writer so zap writes to the raw destination and stamps once itself.
+// isoLayout maps a timestamp-precision string to a Go time layout for an ISO 8601
+// UTC stamp. It mirrors internal/logger.TimeLayout; the mapping is duplicated (one
+// three-line switch) rather than imported so this low-level TLS package does not
+// depend on the logger package. The config layer validates the value up front.
+func isoLayout(precision string) string {
+	switch precision {
+	case "ms":
+		return "2006-01-02T15:04:05.000Z"
+	case "us":
+		return "2006-01-02T15:04:05.000000Z"
+	default: // "second"
+		return "2006-01-02T15:04:05Z"
+	}
+}
+
+func newZapLogger(l *log.Logger, timestampPrecision string) *zap.Logger {
+	layout := isoLayout(timestampPrecision)
 	enc := zapcore.NewConsoleEncoder(zapcore.EncoderConfig{
-		TimeKey:        "", // rcvd's log.Logger already stamps the time on each line
-		LevelKey:       "level",
-		NameKey:        "logger",
-		MessageKey:     "msg",
-		LineEnding:     zapcore.DefaultLineEnding,
+		TimeKey:    "ts",
+		LevelKey:   "level",
+		NameKey:    "logger",
+		MessageKey: "msg",
+		LineEnding: zapcore.DefaultLineEnding,
+		EncodeTime: func(t time.Time, pae zapcore.PrimitiveArrayEncoder) {
+			pae.AppendString(t.UTC().Format(layout))
+		},
 		EncodeLevel:    zapcore.CapitalLevelEncoder,
 		EncodeDuration: zapcore.StringDurationEncoder,
 	})
-	ws := zapcore.AddSync(l.Writer())
+	// Unwrap rcvd's timestamp-prefixing writer so zap's own ISO 8601 stamp is the
+	// only timestamp on each certmagic line (no double-stamp). Falls back to the
+	// logger's writer as-is if it is not the wrapping type.
+	dst := l.Writer()
+	if u, ok := dst.(interface{ Unwrap() io.Writer }); ok {
+		dst = u.Unwrap()
+	}
+	ws := zapcore.AddSync(dst)
 	core := zapcore.NewCore(enc, ws, zapcore.InfoLevel)
 	return zap.New(core).Named("certmagic")
 }
@@ -100,6 +134,12 @@ type AutomationConfig struct {
 	// DNSAPIToken is the DNS provider API token used to write the _acme-challenge TXT
 	// record. Security: scope to a single zone where possible.
 	DNSAPIToken string
+
+	// LogTimestamp is the ISO 8601 fractional precision for certmagic's bridged
+	// log lines — "second" (default), "ms", or "us" — kept in step with rcvd's
+	// own logger so both halves of the file share one timestamp format. Empty
+	// means second precision.
+	LogTimestamp string
 }
 
 // Manager manages TLS certificate automation via certmagic.
@@ -150,7 +190,7 @@ func NewManager(cfg *AutomationConfig, logger *log.Logger) (*Manager, error) {
 	// so ACME/DNS-01 issuance errors are actually visible. Without this certmagic uses
 	// its default logger (its own stderr sink), and under OpenRC that output is lost —
 	// which is why a stuck DNS-01 challenge produced no diagnosable line anywhere.
-	zapLogger := newZapLogger(logger)
+	zapLogger := newZapLogger(logger, cfg.LogTimestamp)
 
 	// Use a pointer so the cache callback can reference magic after it's created.
 	var magic *certmagic.Config
