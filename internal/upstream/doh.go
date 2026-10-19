@@ -108,6 +108,10 @@ func NewDOHListener(addr string, tlsConfig *tls.Config, resolv resolver.Resolver
 		Addr:      addr,
 		TLSConfig: d.h2TLSConfig,
 		Handler:   h2handler,
+		// Bound slow or idle clients (slowloris). DoH requests are tiny, so 5s for
+		// headers is generous; idle keep-alive conns are reaped after 60s.
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	// Wire Go's HTTP/2 protocol handler onto the server explicitly. ConfigureServer
 	// is required because we Serve a manually TLS-wrapped listener (the automatic h2

@@ -4,6 +4,7 @@ package upstream
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -101,16 +102,31 @@ func (d *DOTListener) Serve(ctx context.Context) error {
 
 	// Create a channel for accepting connections in a non-blocking way
 	acceptChan := make(chan net.Conn)
-	acceptErrChan := make(chan error)
+	// Buffered so the accept goroutine can exit after Serve has already returned.
+	acceptErrChan := make(chan error, 1)
 
-	// Goroutine to accept connections
+	// Goroutine to accept connections. Only a closed listener ends the loop; any other
+	// accept error (e.g. EMFILE under load) is retried with backoff, the same approach
+	// net/http takes, so one transient error can't take DoT down for the life of the process.
 	go func() {
+		var backoff time.Duration
 		for {
 			conn, err := d.listener.Accept()
 			if err != nil {
-				acceptErrChan <- err
-				return
+				if errors.Is(err, net.ErrClosed) {
+					acceptErrChan <- err
+					return
+				}
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else if backoff *= 2; backoff > time.Second {
+					backoff = time.Second
+				}
+				d.logger.Printf("DoT accept error: %v; retrying in %v", err, backoff)
+				time.Sleep(backoff)
+				continue
 			}
+			backoff = 0
 			acceptChan <- conn
 		}
 	}()
