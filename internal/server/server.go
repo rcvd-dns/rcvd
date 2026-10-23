@@ -37,6 +37,35 @@ import (
 // EDNS probes (Issue 28).
 const dnsUDPBufSize = 1232
 
+// udpResponseLimit is the largest reply rcvd may send this client over UDP: the payload
+// size the client advertised in its OPT, capped at our own dnsUDPBufSize, or 512 bytes
+// when the query carries no EDNS (RFC 1035 4.2.1, RFC 6891 6.2.3-6.2.5).
+func udpResponseLimit(query *dns.Msg) int {
+	opt := query.IsEdns0()
+	if opt == nil {
+		return dns.MinMsgSize
+	}
+	size := int(opt.UDPSize())
+	if size < dns.MinMsgSize {
+		size = dns.MinMsgSize
+	}
+	if size > dnsUDPBufSize {
+		size = dnsUDPBufSize
+	}
+	return size
+}
+
+// packUDP packs a reply for the UDP listener. A reply larger than udpResponseLimit is
+// truncated with the TC bit set so the client retries over TCP, where serveTCP returns
+// it whole. Without this a large DNSSEC answer (big RSA DNSKEY sets, ML-DSA signatures)
+// went out as one oversized datagram that the client discarded; dnsmasq turned it into
+// SERVFAIL. Call this after ensureResponseEDNS, so the OPT that Truncate keeps is the
+// final one.
+func packUDP(response, query *dns.Msg) ([]byte, error) {
+	response.Truncate(udpResponseLimit(query))
+	return response.Pack()
+}
+
 // Server listens for incoming DNS queries on UDP/TCP and forwards them to resolvers.
 // CRITICAL: No cleartext DNS responses allowed. If all resolvers fail, return SERVFAIL.
 // Queries are cached per TTL; cache can be disabled via config. Blocked domains
@@ -428,7 +457,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 	if len(query.Question) != 1 {
 		response := formErrResponse(query)
 		ensureResponseEDNS(response, query)
-		respBuf, err := response.Pack()
+		respBuf, err := packUDP(response, query)
 		if err != nil {
 			s.logger.Printf("pack FORMERR response error: %v", err)
 			return
@@ -451,7 +480,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 		// Echo EDNS0 so a DNSSEC-probing stub resolver sees an EDNS-capable
 		// server and does not downgrade (Issue 28).
 		ensureResponseEDNS(response, query)
-		respBuf, err := response.Pack()
+		respBuf, err := packUDP(response, query)
 		if err != nil {
 			s.logger.Printf("pack policy response error: %v", err)
 			return
@@ -482,7 +511,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 			// separates DO/non-DO entries, but re-assert OPT+bufsize for Issue 28).
 			ensureResponseEDNS(cached, query)
 			// Encode and send cached response
-			respBuf, err := cached.Pack()
+			respBuf, err := packUDP(cached, query)
 			if err != nil {
 				s.logger.Printf("pack cached response error: %v", err)
 				return
@@ -545,7 +574,7 @@ func (s *Server) handleDNSQuery(queryBuf []byte, remoteAddr net.Addr) {
 	ensureResponseEDNS(response, query)
 
 	// Encode response
-	respBuf, err := response.Pack()
+	respBuf, err := packUDP(response, query)
 	if err != nil {
 		s.logger.Printf("pack response error: %v", err)
 		return

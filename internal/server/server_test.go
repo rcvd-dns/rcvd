@@ -1777,3 +1777,120 @@ func TestServerUDPConcurrentBurstCorrelation(t *testing.T) {
 		}
 	}
 }
+
+// rawUDPExchange sends query over UDP and reads the reply into a 64 KiB buffer, so the
+// test sees the true datagram size instead of whatever a size-limited client accepts.
+func rawUDPExchange(t *testing.T, addr string, query *dns.Msg) (*dns.Msg, int) {
+	t.Helper()
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer conn.Close()
+	wire, err := query.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	if _, err := conn.Write(wire); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	buf := make([]byte, 65535)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	resp := new(dns.Msg)
+	if err := resp.Unpack(buf[:n]); err != nil {
+		t.Fatalf("unpack %d-byte reply: %v", n, err)
+	}
+	return resp, n
+}
+
+// TestUDPReplyTruncatedToClientSize: a UDP reply larger than the client's advertised
+// EDNS size (or 512 bytes without EDNS) must be cut to fit and carry the TC bit, on the
+// upstream path AND the cache-hit path, while TCP returns the whole answer. Before the
+// fix rcvd sent a 2.8 KB ML-DSA DNSSEC answer as one datagram to a client that said
+// 1232; dnsmasq dropped it and answered SERVFAIL.
+func TestUDPReplyTruncatedToClientSize(t *testing.T) {
+	const name = "big.example.com."
+	big := &dns.Msg{
+		MsgHdr:   dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+		Question: []dns.Question{{Name: name, Qtype: dns.TypeTXT, Qclass: dns.ClassINET}},
+	}
+	for i := 0; i < 20; i++ {
+		big.Answer = append(big.Answer, &dns.TXT{
+			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
+			Txt: []string{strings.Repeat(string(rune('a'+i)), 200)},
+		})
+	}
+
+	cfg := &config.Config{
+		Resolver: config.ResolverConfig{Enabled: true, Listen: "127.0.0.1:0"},
+		Cache:    config.CacheConfig{Enabled: true},
+	}
+	mockResolver := &MockResolver{response: big}
+	discardLog := log.New(io.Discard, "", 0)
+	srv := NewServer(cfg, mockResolver,
+		cache.New(cache.Options{Enabled: true, MaxSize: 100, TTLMin: 0, TTLMax: 3600}),
+		blocklist.New(false), nil, nil, discardLog)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server start failed: %v", err)
+	}
+	defer srv.Stop(time.Second)
+	time.Sleep(10 * time.Millisecond)
+	udpAddr := srv.UDPAddr().String()
+
+	cases := []struct {
+		label string
+		edns  uint16 // 0 = no OPT in the query
+		limit int
+	}{
+		{"edns 1232, upstream path", 1232, 1232},
+		{"edns 1232, cache-hit path", 1232, 1232},
+		{"edns 4096 capped at 1232", 4096, 1232},
+		{"no edns", 0, dns.MinMsgSize},
+	}
+	for _, tc := range cases {
+		q := new(dns.Msg)
+		q.SetQuestion(name, dns.TypeTXT)
+		if tc.edns > 0 {
+			q.SetEdns0(tc.edns, true)
+		}
+		resp, n := rawUDPExchange(t, udpAddr, q)
+		if n > tc.limit {
+			t.Errorf("%s: reply is %d bytes, over the %d-byte limit", tc.label, n, tc.limit)
+		}
+		if !resp.Truncated {
+			t.Errorf("%s: TC is not set on an answer larger than the limit", tc.label)
+		}
+		if tc.edns > 0 && resp.IsEdns0() == nil {
+			t.Errorf("%s: truncated reply lost its OPT record", tc.label)
+		}
+	}
+
+	// TCP carries the full answer, untruncated.
+	c := &dns.Client{Net: "tcp"}
+	q := new(dns.Msg)
+	q.SetQuestion(name, dns.TypeTXT)
+	q.SetEdns0(1232, true)
+	resp, _, err := c.Exchange(q, srv.TCPAddr().String())
+	if err != nil {
+		t.Fatalf("TCP exchange: %v", err)
+	}
+	if resp.Truncated || len(resp.Answer) != len(big.Answer) {
+		t.Errorf("TCP: got TC=%v with %d answers, want the full %d untruncated",
+			resp.Truncated, len(resp.Answer), len(big.Answer))
+	}
+
+	// Two upstream calls: one for the DO queries (the rest hit the cache) and one for
+	// the non-EDNS query, which the cache keys separately.
+	if got := mockResolver.CallCount(); got != 2 {
+		t.Errorf("expected 2 upstream calls (DO + non-DO cache keys), got %d", got)
+	}
+}
