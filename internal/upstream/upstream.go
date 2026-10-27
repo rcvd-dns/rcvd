@@ -426,7 +426,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			dotList.Serve(s.ctx)
+			dotList.serve(s.ctx)
 		}()
 		s.logger.Printf("DoT endpoint listening on %s", s.cfg.ListenDoT)
 	}
