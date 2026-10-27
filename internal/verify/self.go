@@ -76,6 +76,7 @@ func VerifySelf(ctx context.Context, configPath string, cfg *config.UpstreamConf
 		result.Name = "Mode-2 " + ep.protocol
 		result.Host = serverName
 		result.Port = ep.port
+		result.Addr = net.JoinHostPort(ep.dialHost, fmt.Sprintf("%d", ep.port))
 		results = append(results, *result)
 	}
 
@@ -204,10 +205,16 @@ func formatSelfResults(configPath, dohHostname string, results []UpstreamResult)
 		fmt.Fprintf(&b, "  DoH hostname: %s (from tls_automation; used as the DoH SNI unless -server-name is given)\n", dohHostname)
 	}
 	b.WriteString("  Probes THIS instance's listeners for the cert it presents to clients.\n")
+	b.WriteString("  Self means self: every probe dials this host's own listen address and never\n")
+	b.WriteString("  leaves this host. It does not test DNS, firewall, NAT, or reachability from\n")
+	b.WriteString("  the internet; run a client from another host for that.\n")
 	b.WriteByte('\n')
 
 	for _, r := range results {
 		fmt.Fprintf(&b, "Endpoint: %s   (SNI %s, port %d)\n", r.Name, r.Host, r.Port)
+		if r.Addr != "" {
+			fmt.Fprintf(&b, "  Probed:         %s %s\n", r.Addr, probeScope(r.Addr))
+		}
 
 		if !r.Success {
 			fmt.Fprintf(&b, "  Connection:  FAILED — %s\n", r.Error)
@@ -258,17 +265,61 @@ func formatSelfResults(configPath, dohHostname string, results []UpstreamResult)
 		// most needs ("am I still on the self-signed autogen, or a real CA cert?").
 		b.WriteByte('\n')
 		fmt.Fprintf(&b, "  Cert source:  %s\n", classifySelfCert(r.Certs))
+		expires := ""
+		if len(r.Certs) > 0 {
+			expires = r.Certs[0].NotAfter.UTC().Format("2006-01-02") + " "
+		}
 		if r.DaysRemaining > 30 {
-			fmt.Fprintf(&b, "  Expiry:       %d days remaining\n", r.DaysRemaining)
+			fmt.Fprintf(&b, "  Expiry:       %s(%d days remaining)\n", expires, r.DaysRemaining)
 		} else if r.DaysRemaining > 0 {
-			fmt.Fprintf(&b, "  Expiry:       WARNING — only %d days remaining\n", r.DaysRemaining)
+			fmt.Fprintf(&b, "  Expiry:       WARNING — %s(only %d days remaining)\n", expires, r.DaysRemaining)
 		} else {
-			b.WriteString("  Expiry:       EXPIRED\n")
+			fmt.Fprintf(&b, "  Expiry:       EXPIRED %s\n", strings.TrimSpace(expires))
 		}
 		b.WriteByte('\n')
 	}
 
 	return b.String()
+}
+
+// probeScope labels the dialed address so the report states plainly that the probe stayed on
+// this host. A loopback or unspecified IP, or an IP bound on a local interface, is delivered by
+// the kernel without touching the wire. A hostname bind was resolved first, so it is labeled as
+// such rather than claimed as local.
+func probeScope(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "(hostname listen address, resolved before dialing)"
+	}
+	if ip.IsLoopback() {
+		return "(loopback, this host's own listener; never left this host)"
+	}
+	if isLocalIP(ip) {
+		return "(local interface address, this host's own listener; never left this host)"
+	}
+	return "(not a local interface address)"
+}
+
+// isLocalIP reports whether ip is loopback or bound on one of this host's interfaces, i.e.
+// a connection to it is delivered by the kernel without touching the wire.
+func isLocalIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // classifySelfCert inspects the presented chain and describes where the cert came from, in the

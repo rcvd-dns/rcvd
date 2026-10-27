@@ -39,6 +39,8 @@ func VerifyPins(ctx context.Context, configPath string, upstreams []config.Upstr
 		pinned     bool
 		ok         bool
 		observed   string // the pin the server actually presented (for MISMATCH diagnosis)
+		dialHost   string // name or IP handed to the dialer
+		remote     string // address the connection actually reached
 		err        string
 	}
 
@@ -60,8 +62,9 @@ func VerifyPins(ctx context.Context, configPath string, upstreams []config.Upstr
 		}
 
 		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		leaf, err := probePinLeaf(probeCtx, &up)
+		leaf, remote, err := probePinLeaf(probeCtx, &up)
 		cancel()
+		r.dialHost, r.remote = up.DialHost(), remote
 		if err != nil {
 			r.err = err.Error()
 			results = append(results, r)
@@ -95,6 +98,7 @@ func VerifyPins(ctx context.Context, configPath string, upstreams []config.Upstr
 			label = "(unnamed)"
 		}
 		fmt.Fprintf(&b, "Upstream %d: %s [%s] %s:%d\n", i, label, r.protocol, r.host, r.port)
+		b.WriteString(upstreamProbedLine(r.dialHost, r.remote))
 		switch {
 		case !r.pinned:
 			b.WriteString("  Pin: (none configured) — use --verify-upstream for CA validation\n")
@@ -132,12 +136,13 @@ func up_pin(upstreams []config.UpstreamServer, i int) string {
 }
 
 // probePinLeaf dials the upstream with CA validation DISABLED (as the live pinned
-// resolver path does) and returns the peer LEAF certificate, WITHOUT judging the
+// resolver path does) and returns the peer LEAF certificate plus the address the
+// connection actually reached, WITHOUT judging the
 // pin — the caller does the SPKI compare. We do NOT VerifyHostname here: the pin,
 // not the name, is the trust root on this path, and requiring a hostname match
 // would re-introduce exactly the CA-shaped failure --verify-pin exists to avoid
 // for an IP-reached self-signed leg.
-func probePinLeaf(ctx context.Context, up *config.UpstreamServer) (*x509.Certificate, error) {
+func probePinLeaf(ctx context.Context, up *config.UpstreamServer) (*x509.Certificate, string, error) {
 	dialHost := up.DialHost()
 	addr := net.JoinHostPort(dialHost, fmt.Sprintf("%d", up.Port))
 
@@ -153,10 +158,11 @@ func probePinLeaf(ctx context.Context, up *config.UpstreamServer) (*x509.Certifi
 		quicConf := &quic.Config{MaxIdleTimeout: 10 * time.Second}
 		conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConf)
 		if err != nil {
-			return nil, fmt.Errorf("QUIC dial: %w", err)
+			return nil, "", fmt.Errorf("QUIC dial: %w", err)
 		}
 		defer func() { _ = conn.CloseWithError(0, "verify-pin complete") }()
-		return leafFrom(conn.ConnectionState().TLS)
+		leaf, err := leafFrom(conn.ConnectionState().TLS)
+		return leaf, conn.RemoteAddr().String(), err
 	}
 
 	// DoT and DoH both terminate as a plain TLS handshake to the listener port.
@@ -166,10 +172,11 @@ func probePinLeaf(ctx context.Context, up *config.UpstreamServer) (*x509.Certifi
 	}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("TLS dial: %w", err)
+		return nil, "", fmt.Errorf("TLS dial: %w", err)
 	}
 	defer conn.Close()
-	return leafFrom(conn.(*tls.Conn).ConnectionState())
+	leaf, err := leafFrom(conn.(*tls.Conn).ConnectionState())
+	return leaf, conn.RemoteAddr().String(), err
 }
 
 func leafFrom(state tls.ConnectionState) (*x509.Certificate, error) {

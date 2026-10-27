@@ -236,3 +236,20 @@ func TestFormatResultsExpiryWarning(t *testing.T) {
 		t.Error("output should contain WARNING for expiring cert")
 	}
 }
+
+func TestUpstreamProbedLine(t *testing.T) {
+	// The line reports where the connection actually went. A hostname that resolved to this
+	// host (e.g. an /etc/hosts entry) must be flagged, not reported as a remote probe.
+	cases := []struct{ dialHost, remote, want string }{
+		{"dns.example.net", "192.0.2.10:853", "dns.example.net -> 192.0.2.10:853 (remote; left this host)"},
+		{"192.0.2.10", "192.0.2.10:853", "192.0.2.10:853 (remote; left this host)"},
+		{"doh.example.net", "127.0.0.1:8443", "doh.example.net -> 127.0.0.1:8443 (resolved to this host"},
+		{"dns.example.net", "", ""},
+	}
+	for _, c := range cases {
+		got := upstreamProbedLine(c.dialHost, c.remote)
+		if c.want == "" && got != "" || !strings.Contains(got, c.want) {
+			t.Errorf("upstreamProbedLine(%q, %q) = %q, want it to contain %q", c.dialHost, c.remote, got, c.want)
+		}
+	}
+}

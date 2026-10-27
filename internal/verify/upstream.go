@@ -34,7 +34,9 @@ type UpstreamResult struct {
 	ChainValid    bool
 	HostnameValid bool
 	DaysRemaining int
-	Pinned        bool // this upstream has a pinned_pubkey configured
+	Pinned        bool   // this upstream has a pinned_pubkey configured
+	Addr          string // address the connection actually reached (host:port)
+	DialHost      string // name or IP handed to the dialer, before resolution
 }
 
 // CertInfo holds human-readable certificate details.
@@ -81,6 +83,7 @@ func VerifyUpstreams(ctx context.Context, configPath string, upstreams []config.
 		result.Host = up.Host
 		result.Port = up.Port
 		result.Pinned = up.PinnedPubKey != ""
+		result.DialHost = dialHost
 
 		results = append(results, *result)
 	}
@@ -119,7 +122,9 @@ func probeDoT(ctx context.Context, host, dialHost string, port int) (*UpstreamRe
 	tlsConn := conn.(*tls.Conn)
 	state := tlsConn.ConnectionState()
 
-	return buildResult("DoT", host, port, state), nil
+	result := buildResult("DoT", host, port, state)
+	result.Addr = conn.RemoteAddr().String()
+	return result, nil
 }
 
 // probeDoQ connects via QUIC+TLS 1.3 (RFC 9250) and extracts the certificate chain.
@@ -146,7 +151,9 @@ func probeDoQ(ctx context.Context, host, dialHost string, port int) (*UpstreamRe
 
 	state := conn.ConnectionState().TLS
 
-	return buildResult("DoQ", host, port, state), nil
+	result := buildResult("DoQ", host, port, state)
+	result.Addr = conn.RemoteAddr().String()
+	return result, nil
 }
 
 // probeDoH connects via TLS to the HTTPS port and extracts the certificate chain.
@@ -173,7 +180,9 @@ func probeDoH(ctx context.Context, host, dialHost string, port int) (*UpstreamRe
 	tlsConn := conn.(*tls.Conn)
 	state := tlsConn.ConnectionState()
 
-	return buildResult("DoH", host, port, state), nil
+	result := buildResult("DoH", host, port, state)
+	result.Addr = conn.RemoteAddr().String()
+	return result, nil
 }
 
 // buildResult constructs an UpstreamResult from a tls.ConnectionState.
@@ -269,6 +278,27 @@ func fingerprint(cert *x509.Certificate) string {
 	return "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
 }
 
+// upstreamProbedLine renders the "Probed:" line for an upstream probe from the address the
+// connection actually reached, not the configured name. A hostname is resolved by the OS
+// (/etc/hosts first, then DNS), so the configured name alone cannot say where packets went;
+// the socket's remote address can. A name that resolved back to this host is flagged, since
+// the probe then checked a local listener and not the remote upstream. Returns "" when no
+// connection was made.
+func upstreamProbedLine(dialHost, remote string) string {
+	if remote == "" {
+		return ""
+	}
+	target := remote
+	if dialHost != "" && net.ParseIP(dialHost) == nil {
+		target = dialHost + " -> " + remote
+	}
+	host, _, err := net.SplitHostPort(remote)
+	if ip := net.ParseIP(host); err == nil && ip != nil && isLocalIP(ip) {
+		return fmt.Sprintf("  Probed:         %s (resolved to this host, not a remote server; check /etc/hosts)\n", target)
+	}
+	return fmt.Sprintf("  Probed:         %s (remote; left this host)\n", target)
+}
+
 // formatResults renders verification results as human-readable text.
 func formatResults(configPath string, results []UpstreamResult) string {
 	var b strings.Builder
@@ -281,6 +311,9 @@ func formatResults(configPath string, results []UpstreamResult) string {
 		// Index is 0-based and matches the [[upstreams]] order — it is the value an
 		// operator passes to the planned `--verify-upstream-key <index>` (see TODO.md).
 		b.WriteString(fmt.Sprintf("Upstream %d: %s [%s] %s:%d\n", i, r.Name, r.Protocol, r.Host, r.Port))
+		if line := upstreamProbedLine(r.DialHost, r.Addr); line != "" {
+			b.WriteString(line)
+		}
 
 		if !r.Success {
 			b.WriteString(fmt.Sprintf("  Connection:  FAILED — %s\n", r.Error))

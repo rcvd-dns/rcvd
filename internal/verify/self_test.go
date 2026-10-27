@@ -4,6 +4,7 @@ package verify
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rcvd-dns/rcvd/internal/config"
 )
@@ -138,5 +139,42 @@ func TestFormatSelfResults_ShowsDoHHostname(t *testing.T) {
 	without := formatSelfResults("/etc/rcvd/rcvd.toml", "", nil)
 	if strings.Contains(without, "DoH hostname:") {
 		t.Errorf("expected no DoH-hostname line when unset, got:\n%s", without)
+	}
+}
+
+func TestFormatSelfResults_LocalProbeAndExpiryDate(t *testing.T) {
+	// The report must state the probe never left this host, show the dialed address, and
+	// print the leaf expiry as an ISO date next to the days-remaining count.
+	notAfter := time.Date(2027, 1, 20, 12, 0, 0, 0, time.UTC)
+	results := []UpstreamResult{{
+		Name: "Mode-2 DoH", Host: "doh.example.net", Port: 8443, Protocol: "DoH",
+		Success: true, Addr: "127.0.0.1:8443", DaysRemaining: 85,
+		Certs: []CertInfo{{Subject: "CN=doh.example.net", Issuer: "CN=YE2", NotAfter: notAfter}},
+	}}
+	out := formatSelfResults("/etc/rcvd/rcvd.toml", "doh.example.net", results)
+	for _, want := range []string{
+		"never\n  leaves this host",
+		"Probed:         127.0.0.1:8443 (loopback, this host's own listener; never left this host)",
+		"Expiry:       2027-01-20 (85 days remaining)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in report, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestProbeScope(t *testing.T) {
+	cases := map[string]string{
+		"127.0.0.1:8443":   "loopback",
+		"[::1]:853":        "loopback",
+		"rcvd.example:443": "hostname",
+		"192.0.2.1:443":    "not a local interface",
+		"no-port-here":     "",
+	}
+	for addr, want := range cases {
+		got := probeScope(addr)
+		if want == "" && got != "" || !strings.Contains(got, want) {
+			t.Errorf("probeScope(%q) = %q, want it to contain %q", addr, got, want)
+		}
 	}
 }

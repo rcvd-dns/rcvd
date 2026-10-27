@@ -41,7 +41,7 @@ func ShowPin(ctx context.Context, upstreams []config.UpstreamServer, index int) 
 	// --show-pin reads the SAME leaf the pinned resolver path would, and works on a
 	// self-signed leg. We compute the pin from that leaf — the single source of
 	// truth in config.SPKIPin, shared with --verify-pin and the config loader.
-	leaf, err := probePinLeaf(probeCtx, &up)
+	leaf, _, err := probePinLeaf(probeCtx, &up)
 	if err != nil {
 		return "", fmt.Errorf("probe upstream %d (%s %s:%d): %w", index, up.Name, up.Host, up.Port, err)
 	}
