@@ -105,6 +105,10 @@ func (t *TLSResolver) resolveOnce(ctx context.Context, msg *dns.Msg) (*dns.Msg, 
 	if err != nil {
 		return nil, fmt.Errorf("DoT pack: %w", err)
 	}
+	// The 2-byte prefix cannot express more than 65535 bytes; refuse rather than wrap it.
+	if len(msgBytes) > dns.MaxMsgSize {
+		return nil, fmt.Errorf("DoT pack: query is %d bytes, over the %d-byte limit", len(msgBytes), dns.MaxMsgSize)
+	}
 
 	// Write length-prefixed DNS message (RFC 1035 §4.2.2)
 	lengthPrefix := []byte{byte(len(msgBytes) >> 8), byte(len(msgBytes))}

@@ -339,10 +339,13 @@ func (d *DOTListener) handleConnection(conn net.Conn, ctx context.Context) {
 		ensureResponseEDNS(response, query)
 
 		// Encode response
-		respBuf, err := response.Pack()
+		respBuf, replaced, err := packStream(response, query)
 		if err != nil {
 			d.logger.Printf("DoT pack error: %v", err)
 			return
+		}
+		if replaced {
+			d.logger.Printf("DoT reply exceeded %d bytes; sent SERVFAIL instead", dns.MaxMsgSize)
 		}
 
 		// Write response with length prefix

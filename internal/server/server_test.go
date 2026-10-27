@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"crypto"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -1892,5 +1893,51 @@ func TestUDPReplyTruncatedToClientSize(t *testing.T) {
 	// the non-EDNS query, which the cache keys separately.
 	if got := mockResolver.CallCount(); got != 2 {
 		t.Errorf("expected 2 upstream calls (DO + non-DO cache keys), got %d", got)
+	}
+}
+
+// TestPackStreamOversizedBecomesServfail: a reply over 65535 bytes cannot be framed by the
+// 2-byte stream length prefix, so packStream must swap it for a SERVFAIL that fits, while a
+// normal reply passes through untouched.
+func TestPackStreamOversizedBecomesServfail(t *testing.T) {
+	const name = "big.example.com."
+	query := new(dns.Msg)
+	query.SetQuestion(name, dns.TypeTXT)
+	query.SetEdns0(1232, true)
+
+	big := new(dns.Msg)
+	big.SetReply(query)
+	for i := 0; i < 320; i++ {
+		big.Answer = append(big.Answer, &dns.TXT{
+			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300},
+			Txt: []string{fmt.Sprintf("%03d%s", i, strings.Repeat("x", 200))},
+		})
+	}
+	if raw, err := big.Pack(); err != nil || len(raw) <= dns.MaxMsgSize {
+		t.Fatalf("test reply must exceed %d bytes, got %d (err %v)", dns.MaxMsgSize, len(raw), err)
+	}
+
+	buf, replaced, err := packStream(big, query)
+	if err != nil {
+		t.Fatalf("packStream: %v", err)
+	}
+	if !replaced || len(buf) > dns.MaxMsgSize {
+		t.Fatalf("replaced=%v len=%d, want a replaced reply within %d bytes", replaced, len(buf), dns.MaxMsgSize)
+	}
+	got := new(dns.Msg)
+	if err := got.Unpack(buf); err != nil {
+		t.Fatalf("unpack: %v", err)
+	}
+	if got.Rcode != dns.RcodeServerFailure || got.Id != query.Id || len(got.Answer) != 0 {
+		t.Fatalf("want empty SERVFAIL for id %d, got rcode %d id %d answers %d", query.Id, got.Rcode, got.Id, len(got.Answer))
+	}
+	if got.IsEdns0() == nil {
+		t.Fatal("SERVFAIL to an EDNS query must carry an OPT")
+	}
+
+	small := new(dns.Msg)
+	small.SetReply(query)
+	if _, replaced, err := packStream(small, query); err != nil || replaced {
+		t.Fatalf("normal reply: replaced=%v err=%v, want passthrough", replaced, err)
 	}
 }

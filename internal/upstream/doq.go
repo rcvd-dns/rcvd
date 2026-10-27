@@ -408,10 +408,13 @@ func (d *DOQListener) handleStream(ctx context.Context, stream *quic.Stream) {
 	ensureResponseEDNS(response, query)
 
 	// Encode response
-	respBuf, err := response.Pack()
+	respBuf, replaced, err := packStream(response, query)
 	if err != nil {
 		d.logger.Printf("DoQ pack error: %v", err)
 		return
+	}
+	if replaced {
+		d.logger.Printf("DoQ reply exceeded %d bytes; sent SERVFAIL instead", dns.MaxMsgSize)
 	}
 
 	// Write response with length prefix. A write failure here is almost always the client

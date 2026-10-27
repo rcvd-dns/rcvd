@@ -342,6 +342,25 @@ func ensureResponseEDNS(response, query *dns.Msg) {
 	opt.SetUDPSize(dnsUDPBufSize)
 }
 
+// packStream packs a reply for a length-prefixed stream transport (Mode-1 TCP). The 2-byte
+// length prefix caps a message at 65535 bytes (RFC 1035 4.2.2, RFC 9250 4.2), and Pack does
+// not enforce that limit: an oversized reply would wrap the prefix and desync every later
+// message on the connection. Such a reply is replaced with SERVFAIL, and replaced reports it
+// so the caller can log. Call this after ensureResponseEDNS.
+func packStream(response, query *dns.Msg) (buf []byte, replaced bool, err error) {
+	buf, err = response.Pack()
+	if err != nil || len(buf) <= dns.MaxMsgSize {
+		return buf, false, err
+	}
+	servfail := &dns.Msg{
+		MsgHdr:   dns.MsgHdr{Id: query.Id, Response: true, Rcode: dns.RcodeServerFailure},
+		Question: query.Question,
+	}
+	ensureResponseEDNS(servfail, query)
+	buf, err = servfail.Pack()
+	return buf, true, err
+}
+
 // stripDNSSECRecords removes DNSSEC meta-records (RRSIG, NSEC, NSEC3, DNSKEY, DS) from every
 // section of the response in place, for delivery to a client that did not set the DO bit
 // (RFC 6840 §5.9). The OPT pseudo-record in Extra is left alone — ensureResponseEDNS owns the
@@ -766,10 +785,13 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 		ensureResponseEDNS(response, query)
 
 		// Encode and send response with length prefix
-		respBuf, err := response.Pack()
+		respBuf, replaced, err := packStream(response, query)
 		if err != nil {
 			s.logger.Printf("TCP pack error: %v", err)
 			return
+		}
+		if replaced {
+			s.logger.Printf("TCP reply exceeded %d bytes; sent SERVFAIL instead", dns.MaxMsgSize)
 		}
 
 		respLen := []byte{byte(len(respBuf) >> 8), byte(len(respBuf))}

@@ -192,6 +192,11 @@ func (q *DoQResolver) exchangeOnce(ctx context.Context, msg *dns.Msg) (*dns.Msg,
 		stream.Close()
 		return nil, false, fmt.Errorf("DoQ pack: %w", err)
 	}
+	// The 2-byte prefix cannot express more than 65535 bytes; refuse rather than wrap it.
+	if len(msgBytes) > dns.MaxMsgSize {
+		stream.Close()
+		return nil, false, fmt.Errorf("DoQ pack: query is %d bytes, over the %d-byte limit", len(msgBytes), dns.MaxMsgSize)
+	}
 
 	// Write length-prefixed DNS message (RFC 9250 §4.2)
 	lengthPrefix := []byte{byte(len(msgBytes) >> 8), byte(len(msgBytes))}

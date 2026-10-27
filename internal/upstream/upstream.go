@@ -116,6 +116,25 @@ func ensureResponseEDNS(response, query *dns.Msg) {
 	response.SetEdns0(ednsUDPBufSize, clientDO)
 }
 
+// packStream packs a reply for a length-prefixed stream transport (DoT, DoQ). The 2-byte
+// length prefix caps a message at 65535 bytes (RFC 1035 4.2.2, RFC 9250 4.2), and Pack does
+// not enforce that limit: an oversized reply would wrap the prefix and desync every later
+// message on the connection. Such a reply is replaced with SERVFAIL, and replaced reports it
+// so the caller can log. Call this after ensureResponseEDNS.
+func packStream(response, query *dns.Msg) (buf []byte, replaced bool, err error) {
+	buf, err = response.Pack()
+	if err != nil || len(buf) <= dns.MaxMsgSize {
+		return buf, false, err
+	}
+	servfail := &dns.Msg{
+		MsgHdr:   dns.MsgHdr{Id: query.Id, Response: true, Rcode: dns.RcodeServerFailure},
+		Question: query.Question,
+	}
+	ensureResponseEDNS(servfail, query)
+	buf, err = servfail.Pack()
+	return buf, true, err
+}
+
 // stripDNSSECRecords removes DNSSEC meta-records (RRSIG, NSEC, NSEC3, DNSKEY, DS) from
 // every section of the response in place, for a client that did not set the DO bit
 // (RFC 6840 §5.9). The OPT pseudo-record is left alone — ensureResponseEDNS owns it. The
