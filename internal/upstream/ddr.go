@@ -342,10 +342,11 @@ func ddrSOA() *dns.SOA {
 }
 
 // advertPort returns the port to advertise for a listener, parsed from its "host:port"
-// listen address, falling back to def when the address cannot be parsed.
+// listen address, falling back to def when the address cannot be parsed or the port is out
+// of range.
 func advertPort(listenAddr string, def int) int {
 	if _, port, err := net.SplitHostPort(listenAddr); err == nil {
-		if p, err := strconv.Atoi(port); err == nil && p > 0 {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 && p <= 65535 {
 			return p
 		}
 	}

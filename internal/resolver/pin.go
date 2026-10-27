@@ -83,7 +83,7 @@ func pinnedTLSConfig(conf *tls.Config, host, pin string) *tls.Config {
 	}
 
 	// Replace CA-chain trust with exact-key trust for THIS upstream only.
-	conf.InsecureSkipVerify = true // < the only InsecureSkipVerify in the codebase; pin-gated, see file header
+	conf.InsecureSkipVerify = true // < the only InsecureSkipVerify on a query path; pin-gated, see file header
 	conf.VerifyConnection = func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) == 0 {
 			return fmt.Errorf("pin: no peer certificate presented")

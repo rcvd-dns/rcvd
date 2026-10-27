@@ -427,6 +427,7 @@ func TestAdvertPort(t *testing.T) {
 		{"0.0.0.0:853", 853, 853},
 		{"nonsense", 443, 443},      // fallback to the caller's default
 		{"host:notaport", 853, 853}, // non-numeric port falls back
+		{"0.0.0.0:65536", 853, 853}, // out of uint16 range falls back
 	}
 	for _, tc := range tests {
 		if got := advertPort(tc.addr, tc.def); got != tc.want {
